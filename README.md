@@ -8,6 +8,7 @@ Frontend dashboard for visualizing experiment data served by MoST-API.
 - Experiment list on the left with selection highlight
 - Per-experiment ZIP download including only `results.csv` files, preserving iteration folder structure
 - `EXPERIMENT_TYPE` from `results.csv` is shown in the Experiments Matrix title, the chart title, and as the prefix of the absolute value of each matrix cell (for example `MST Experiments Matrix`, `MST · 1-100/1-100`, `MST: 256`). When the field is missing from a `results.csv` that has results, it defaults to `MST`; when an experiment has no results, no type is displayed and the titles stay unchanged.
+- Additive experiments (`WORKLOAD_MIXES` runs; `Experiment_MIX_*` results sources holding `mix_...` folders) replace the interval matrix with a vertical list of the sub-experiments of that run. Each row shows the canonical mix, the absolute `LARGEST_TRUE` (prefixed with `EXPERIMENT_TYPE`) and its inverse-normalized value, reusing the same finished/pending colors as the matrix cells; selecting a row plots that sub-experiment in the chart and the Iteration Detail table. The panel title becomes `MST Additive Experiments` and the chart title shows the canonical mix instead of the raw folder name.
 - Line chart in the center:
 	- X axis: iteration count
 	- Y axis: requests sent per minute

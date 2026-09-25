@@ -376,6 +376,26 @@ function formatExperimentType(value) {
   return normalized || DEFAULT_EXPERIMENT_TYPE
 }
 
+// Additive experiments (WORKLOAD_MIXES runs) store one folder per `mix_...` sub-experiment
+// instead of one folder per input/output interval pair. The API mirrors that prefix, so the
+// dashboard uses it to tell both layouts apart when deciding what to render.
+const ADDITIVE_EXPERIMENT_PREFIX = 'mix_'
+
+function isAdditiveExperimentName(experimentName) {
+  return String(experimentName || '').trim().toLowerCase().startsWith(ADDITIVE_EXPERIMENT_PREFIX)
+}
+
+// The canonical mix (for example `[(1-100:1-100,0.5),(300-600:100-300,0.5)]`) is what the
+// additivity of a sub-experiment is described by; fall back to the raw folder name when absent.
+function formatAdditiveLabel(additive) {
+  if (!additive) {
+    return ''
+  }
+
+  const canonical = typeof additive.canonical === 'string' ? additive.canonical.trim() : ''
+  return canonical || additive.name || ''
+}
+
 function formatResultsScopeLabel(scope) {
   if (!scope || scope === DEFAULT_RESULTS_SCOPE) {
     return 'Current results'
@@ -474,6 +494,51 @@ async function fetchExperimentIterations(experimentName, port, resultsScope) {
 
   const data = await response.json()
   return sortIterationsChronologically(data.iterations || [])
+}
+
+function buildEmptyExperimentStatus() {
+  return {
+    hasResults: false,
+    finished: false,
+    largestTrue: null,
+    experimentType: null,
+    additive: null,
+  }
+}
+
+// Shared by the interval matrix and the additive sub-experiment list: both need the latest
+// `results.csv` summary of an experiment. `additive` carries the API descriptor for `mix_...`
+// experiments and stays null for interval-pair experiments.
+async function fetchExperimentStatus(experiment, port, resultsScope) {
+  try {
+    const iterations = await fetchExperimentIterations(experiment, port, resultsScope)
+    if (iterations.length === 0) {
+      return buildEmptyExperimentStatus()
+    }
+
+    const latestIteration = iterations[iterations.length - 1]
+    const csv = await fetchJson(
+      `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(latestIteration)}/results.csv`,
+      port,
+      { resultsScope },
+    )
+
+    const rows = csv.rows || []
+    const latestRow = rows.length > 0 ? rows[rows.length - 1] : null
+    if (!latestRow) {
+      return buildEmptyExperimentStatus()
+    }
+
+    return {
+      hasResults: true,
+      finished: parseBoolean(getFieldValue(latestRow, FINISHED_KEYS)),
+      largestTrue: parseNumber(getFieldValue(latestRow, LARGEST_TRUE_KEYS)),
+      experimentType: formatExperimentType(getFieldValue(latestRow, EXPERIMENT_TYPE_KEYS)),
+      additive: csv.additive && csv.additive.isAdditive ? csv.additive : null,
+    }
+  } catch {
+    return buildEmptyExperimentStatus()
+  }
 }
 
 async function fetchExperimentStatusForPort(port) {
@@ -642,6 +707,7 @@ function App() {
   const [selectedResultsScope, setSelectedResultsScope] = useState(DEFAULT_RESULTS_SCOPE)
   const [headerData, setHeaderData] = useState({ llm: 'Loading...', gpu: 'Loading...', modelUrl: 'Loading...' })
   const [experiments, setExperiments] = useState([])
+  const [additiveExperiments, setAdditiveExperiments] = useState([])
   const [selectedExperiment, setSelectedExperiment] = useState('')
   const [iterationData, setIterationData] = useState([])
   const [selectedIteration, setSelectedIteration] = useState('')
@@ -779,16 +845,26 @@ function App() {
           resultsScope: selectedResultsScope,
         })
         const apiList = data.experiments || []
+        const additiveList = (data.additiveExperiments || []).filter((entry) => entry && entry.name)
+        const additiveNames = new Set(additiveList.map((entry) => entry.name))
         const configuredList = buildConfiguredExperimentList(EXPERIMENT_LIST_RAW)
-        const matrixList = configuredList.length > 0 ? configuredList : apiList
+        const intervalList = (configuredList.length > 0 ? configuredList : apiList).filter(
+          (experiment) => !additiveNames.has(experiment) && !isAdditiveExperimentName(experiment),
+        )
+        // An additive results source exposes only `mix_...` sub-experiments, so the panel lists
+        // them instead of the interval matrix. `experiments` stays "the selectable experiments of
+        // this results source", which keeps the status, chart and detail flows untouched.
+        const selectableList =
+          additiveList.length > 0 ? additiveList.map((entry) => entry.name) : intervalList
 
-        setExperiments(matrixList)
+        setAdditiveExperiments(additiveList)
+        setExperiments(selectableList)
         setSelectedExperiment((previous) => {
-          if (matrixList.length === 0) {
+          if (selectableList.length === 0) {
             return ''
           }
 
-          return matrixList.includes(previous) ? previous : matrixList[0]
+          return selectableList.includes(previous) ? previous : selectableList[0]
         })
       } catch {
         setErrorMessage('Unable to load experiments from API.')
@@ -812,72 +888,10 @@ function App() {
 
       try {
         const statuses = await Promise.all(
-          experiments.map(async (experiment) => {
-            try {
-              const iterations = await fetchExperimentIterations(
-                experiment,
-                activeApiPort,
-                selectedResultsScope,
-              )
-              if (iterations.length === 0) {
-                return [
-                  experiment,
-                  {
-                    hasResults: false,
-                    finished: false,
-                    largestTrue: null,
-                    experimentType: null,
-                  },
-                ]
-              }
-
-              const latestIteration = iterations[iterations.length - 1]
-              const csv = await fetchJson(
-                `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(latestIteration)}/results.csv`,
-                activeApiPort,
-                { resultsScope: selectedResultsScope },
-              )
-
-              const rows = csv.rows || []
-              const latestRow = rows.length > 0 ? rows[rows.length - 1] : null
-              if (!latestRow) {
-                return [
-                  experiment,
-                  {
-                    hasResults: false,
-                    finished: false,
-                    largestTrue: null,
-                    experimentType: null,
-                  },
-                ]
-              }
-
-              const finished = parseBoolean(getFieldValue(latestRow, FINISHED_KEYS))
-              const largestTrue = parseNumber(getFieldValue(latestRow, LARGEST_TRUE_KEYS))
-
-              return [
-                experiment,
-                {
-                  hasResults: true,
-                  finished,
-                  largestTrue,
-                  experimentType: formatExperimentType(
-                    getFieldValue(latestRow, EXPERIMENT_TYPE_KEYS),
-                  ),
-                },
-              ]
-            } catch {
-              return [
-                experiment,
-                {
-                  hasResults: false,
-                  finished: false,
-                  largestTrue: null,
-                  experimentType: null,
-                },
-              ]
-            }
-          }),
+          experiments.map(async (experiment) => [
+            experiment,
+            await fetchExperimentStatus(experiment, activeApiPort, selectedResultsScope),
+          ]),
         )
 
         if (!isCancelled) {
@@ -991,6 +1005,9 @@ function App() {
 
   const matrixModel = useMemo(() => {
     const pairEntries = experiments
+      // Additive sub-experiments (`mix_...`) do not describe an interval pair, so feeding them to
+      // parseExperimentPair would fabricate bogus matrix cells.
+      .filter((experiment) => !isAdditiveExperimentName(experiment))
       .map((experiment) => {
         const parsed = parseExperimentPair(experiment)
         if (!parsed) {
@@ -1036,6 +1053,23 @@ function App() {
 
     return types[0] || null
   }, [experimentStatuses])
+
+  // An additive results source exposes `mix_...` sub-experiments and no interval pairs, so the
+  // panel renders that vertical list instead of the matrix.
+  const isAdditiveMode = additiveExperiments.length > 0
+
+  const additiveDescriptorByName = useMemo(
+    () => Object.fromEntries(additiveExperiments.map((entry) => [entry.name, entry])),
+    [additiveExperiments],
+  )
+
+  const selectedAdditive = isAdditiveMode
+    ? additiveDescriptorByName[selectedExperiment] || null
+    : null
+
+  const selectedExperimentLabel = selectedAdditive
+    ? formatAdditiveLabel(selectedAdditive)
+    : formatExperimentLabel(selectedExperiment)
 
   const finishedLargestTrueValues = useMemo(
     () =>
@@ -1588,14 +1622,28 @@ function App() {
       <main className="dashboard-main">
         <aside className="experiment-panel">
           <div className="experiment-panel-header">
-            <h2>{matrixExperimentType ? `${matrixExperimentType} Experiments Matrix` : 'Experiments Matrix'}</h2>
+            <h2>
+              {isAdditiveMode
+                ? `${matrixExperimentType ? `${matrixExperimentType} ` : ''}Additive Experiments`
+                : matrixExperimentType
+                  ? `${matrixExperimentType} Experiments Matrix`
+                  : 'Experiments Matrix'}
+            </h2>
             <div className="button-group">
               <button
                 type="button"
                 className="icon-button"
                 onClick={downloadMatrixCsvZip}
-                title="Download matrix CSV zip"
-                aria-label="Download matrix CSV zip"
+                title={
+                  isAdditiveMode
+                    ? 'Matrix CSV zip is unavailable for additive results'
+                    : 'Download matrix CSV zip'
+                }
+                aria-label={
+                  isAdditiveMode
+                    ? 'Matrix CSV zip is unavailable for additive results'
+                    : 'Download matrix CSV zip'
+                }
                 disabled={matrixExperiments.length === 0 || busyMatrixDownload}
               >
                 <Download size={16} />
@@ -1604,8 +1652,10 @@ function App() {
                 type="button"
                 className="icon-button"
                 onClick={() => selectedExperiment && downloadExperimentCsvZip(selectedExperiment)}
-                title="Download selected cell CSV zip"
-                aria-label="Download selected cell CSV zip"
+                title={isAdditiveMode ? 'Download selected mix CSV zip' : 'Download selected cell CSV zip'}
+                aria-label={
+                  isAdditiveMode ? 'Download selected mix CSV zip' : 'Download selected cell CSV zip'
+                }
                 disabled={!selectedExperiment || busyExperimentDownload === selectedExperiment}
               >
                 <FileDown size={16} />
@@ -1627,10 +1677,67 @@ function App() {
             </select>
           </div>
           <p className="matrix-helper">
-            Rows: input intervals. Columns: output intervals. Cells show absolute (top) and inverse-normalized (bottom) values.
+            {isAdditiveMode
+              ? 'Rows: additive workload mixes of this results source. Each row shows absolute (top) and inverse-normalized (bottom) values; select one to plot its iterations.'
+              : 'Rows: input intervals. Columns: output intervals. Cells show absolute (top) and inverse-normalized (bottom) values.'}
           </p>
 
-          {matrixModel.inputRanges.length === 0 || matrixModel.outputRanges.length === 0 ? (
+          {isAdditiveMode ? (
+            additiveExperiments.length === 0 ? (
+              <p className="placeholder">No additive experiments found.</p>
+            ) : (
+              <div className="additive-list">
+                {additiveExperiments.map((entry) => {
+                  const status = experimentStatuses[entry.name]
+                  const isSelected = entry.name === selectedExperiment
+                  const hasValue = Number.isFinite(status?.largestTrue)
+                  const absoluteValue = hasValue ? status.largestTrue : null
+                  const inverseNormalizedValue = hasValue
+                    ? getInverseNormalizedValue(status.largestTrue)
+                    : null
+                  const absoluteText = absoluteValue !== null ? formatMatrixValue(absoluteValue) : ''
+                  const itemExperimentType = status?.hasResults
+                    ? status?.experimentType || matrixExperimentType
+                    : null
+                  const inverseText = hasValue
+                    ? inverseNormalizedValue === null
+                      ? 'n/a'
+                      : formatMatrixValue(inverseNormalizedValue)
+                    : ''
+
+                  let backgroundColor = '#ffffff'
+                  let tone = 'empty'
+
+                  if (status?.hasResults && !status?.finished) {
+                    backgroundColor = '#ffd1e3'
+                    tone = 'pending'
+                  } else if (status?.hasResults && status?.finished) {
+                    backgroundColor = getHeatmapColor(absoluteValue, heatScale.min, heatScale.max)
+                    tone = 'finished'
+                  }
+
+                  return (
+                    <button
+                      key={`additive-${entry.name}`}
+                      type="button"
+                      className={`additive-item ${isSelected ? 'is-selected' : ''}`}
+                      data-tone={tone}
+                      style={{ backgroundColor, color: getTextColorForBackground(backgroundColor) }}
+                      onClick={() => setSelectedExperiment(entry.name)}
+                      title={entry.name}
+                    >
+                      <span className="additive-item-canonical">{formatAdditiveLabel(entry)}</span>
+                      <span className="additive-item-value">
+                        {itemExperimentType ? `${itemExperimentType}: ` : ''}
+                        {absoluteText}
+                      </span>
+                      <span className="additive-item-meta">&sigma;: {inverseText}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            )
+          ) : matrixModel.inputRanges.length === 0 || matrixModel.outputRanges.length === 0 ? (
             <p className="placeholder">No interval-pair experiments found.</p>
           ) : (
             <div className="experiment-matrix-wrapper">
@@ -1709,15 +1816,19 @@ function App() {
               </div>
             </div>
           )}
-          {loadingMatrixStatus && <p className="matrix-loading">Updating matrix status...</p>}
+          {loadingMatrixStatus && (
+            <p className="matrix-loading">
+              {isAdditiveMode ? 'Updating additive status...' : 'Updating matrix status...'}
+            </p>
+          )}
         </aside>
 
         <section className="chart-panel">
           <div className="chart-header">
             <h2>
               {selectedExperimentType
-                ? `${selectedExperimentType} · ${formatExperimentLabel(selectedExperiment)}`
-                : formatExperimentLabel(selectedExperiment)}
+                ? `${selectedExperimentType} · ${selectedExperimentLabel}`
+                : selectedExperimentLabel}
             </h2>
             <div className="chart-legend">
               <span><i className="dot stage-1" />Stage 1</span>
