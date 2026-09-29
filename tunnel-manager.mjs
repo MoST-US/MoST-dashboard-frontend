@@ -3,6 +3,16 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import http from 'node:http'
 import { fileURLToPath } from 'node:url'
+import {
+  MAX_UPLOAD_BODY_BYTES,
+  buildResultsFolderName,
+  describeGitHubConfig,
+  isGitHubConfigured,
+  listGpuNodes,
+  readGitHubConfig,
+  resolveGpuTypeForNode,
+  uploadResults,
+} from './github-results-uploader.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -195,6 +205,7 @@ const managerState = {
 }
 
 let config
+let githubConfig = null
 const tunnels = new Map()
 
 async function checkApiHealth(tunnel) {
@@ -402,6 +413,65 @@ async function readJsonBody(req) {
   })
 }
 
+// Same contract as `readJsonBody`, but bounded: an upload body carries base64 CSV content, so an
+// oversized payload is refused instead of being buffered without a limit. Once the limit is hit the
+// request keeps draining, which lets the 413 response be written immediately.
+async function readJsonBodyLimited(req, maxBytes) {
+  return new Promise((resolve) => {
+    const chunks = []
+    let size = 0
+    let settled = false
+
+    const finish = (result) => {
+      if (!settled) {
+        settled = true
+        resolve(result)
+      }
+    }
+
+    req.on('data', (chunk) => {
+      if (settled) {
+        return
+      }
+
+      size += chunk.length
+      if (size > maxBytes) {
+        finish({
+          ok: false,
+          statusCode: 413,
+          error: `The upload body is larger than ${Math.round(maxBytes / (1024 * 1024))} MB. Upload fewer experiments or a single experiment at a time.`,
+        })
+        return
+      }
+
+      chunks.push(chunk)
+    })
+
+    req.on('end', () => {
+      if (chunks.length === 0) {
+        finish({ ok: false, statusCode: 400, error: 'The request body is empty.' })
+        return
+      }
+
+      try {
+        const value = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        if (!value || typeof value !== 'object') {
+          finish({ ok: false, statusCode: 400, error: 'The request body must be a JSON object.' })
+          return
+        }
+
+        finish({ ok: true, value })
+      } catch {
+        finish({ ok: false, statusCode: 400, error: 'The request body is not valid JSON.' })
+      }
+    })
+
+    req.on('error', () =>
+      finish({ ok: false, statusCode: 400, error: 'Unable to read the request body.' }),
+    )
+  })
+}
+
 function jsonResponse(res, statusCode, payload) {
   res.statusCode = statusCode
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -409,6 +479,97 @@ function jsonResponse(res, statusCode, payload) {
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
   res.end(JSON.stringify(payload))
+}
+
+// `['Experiment_MIT_2026-09-29_10-00-00']` -> `/Experiment_MIT_2026-09-29_10-00-00`, while an upload
+// that swept several archives is described as ` (3 experiment folders)`.
+function describeUploadExperiments(experimentFolders) {
+  const folders = Array.isArray(experimentFolders) ? experimentFolders : []
+
+  if (folders.length === 0) {
+    return ''
+  }
+
+  if (folders.length === 1) {
+    return `/${folders[0]}`
+  }
+
+  return ` (${folders.length} experiment folders)`
+}
+
+// Commits the results the dashboard collected (the same `results.csv` folder tree the ZIP download
+// builds) into the results repository. The upload itself runs here so the GitHub token never leaves
+// the server-side .env, and one request produces exactly one commit. Every posted file names the
+// experiment (results source) it was read from, which becomes the folder level between the GPU folder
+// and the sub-experiment folder: `results/<model>-<gpuType>-<N>gpus/<experiment>/<sub-experiment>/<iteration>/`.
+async function handleGitHubUpload(req, res) {
+  if (!isGitHubConfigured(githubConfig)) {
+    jsonResponse(res, 409, {
+      error: describeGitHubConfig(githubConfig).message || 'GitHub upload is not configured.',
+    })
+    return
+  }
+
+  const body = await readJsonBodyLimited(req, MAX_UPLOAD_BODY_BYTES)
+  if (!body.ok) {
+    jsonResponse(res, body.statusCode, { error: body.error })
+    return
+  }
+
+  const payload = body.value
+  const model = typeof payload.model === 'string' ? payload.model.trim() : ''
+  const node = typeof payload.node === 'string' ? payload.node.trim() : ''
+  const gpuCount = Number(payload.gpuCount)
+
+  if (!model) {
+    jsonResponse(res, 400, { error: 'A model name is required to build the upload folder.' })
+    return
+  }
+
+  if (!node) {
+    jsonResponse(res, 400, { error: 'The GPU host (node) is required to resolve the GPU type.' })
+    return
+  }
+
+  const gpuType = resolveGpuTypeForNode(githubConfig.gpuTypeMap, node)
+  if (!gpuType) {
+    jsonResponse(res, 400, {
+      error: `Node "${node}" is not mapped to a GPU type. Known nodes: ${listGpuNodes(githubConfig.gpuTypeMap).join(', ')}. Extend GPU_TYPE_MAP in .env.`,
+    })
+    return
+  }
+
+  const folderName = buildResultsFolderName({ model, gpuType, gpuCount })
+  if (!folderName.ok) {
+    jsonResponse(res, 400, { error: folderName.error })
+    return
+  }
+
+  try {
+    const result = await uploadResults({
+      config: githubConfig,
+      folder: folderName.folder,
+      files: payload.files,
+      commitMessage: typeof payload.commitMessage === 'string' ? payload.commitMessage : '',
+    })
+
+    jsonResponse(res, 200, {
+      ...result,
+      gpuType,
+      node,
+      gpuCount,
+      message: result.unchanged
+        ? `No new results to commit for ${folderName.folder}: the repository already has this content.`
+        : `Uploaded ${result.fileCount} file(s) to ${result.folderPath}${describeUploadExperiments(result.experimentFolders)}.`,
+    })
+  } catch (error) {
+    const statusCode =
+      error instanceof Error && Number.isInteger(error.statusCode) ? error.statusCode : 502
+
+    jsonResponse(res, statusCode, {
+      error: error instanceof Error ? error.message : 'Unable to upload the results to GitHub.',
+    })
+  }
 }
 
 async function requestHandler(req, res) {
@@ -477,6 +638,16 @@ async function requestHandler(req, res) {
     return
   }
 
+  if (req.method === 'GET' && urlObject.pathname === '/github/status') {
+    jsonResponse(res, 200, describeGitHubConfig(githubConfig))
+    return
+  }
+
+  if (req.method === 'POST' && urlObject.pathname === '/github/upload') {
+    await handleGitHubUpload(req, res)
+    return
+  }
+
   if (req.method === 'GET' && urlObject.pathname === '/health') {
     jsonResponse(res, 200, { ok: true, service: 'tunnel-manager' })
     return
@@ -489,6 +660,7 @@ async function main() {
   const fileEnv = await loadEnv()
   const mergedEnv = { ...fileEnv, ...process.env }
   config = buildBaseConfig(mergedEnv)
+  githubConfig = readGitHubConfig(mergedEnv)
 
   for (const port of config.ports) {
     const tunnel = {
@@ -514,6 +686,13 @@ async function main() {
   server.listen(config.managerPort, config.managerBind, () => {
     console.log(`Tunnel manager listening on http://${config.managerBind}:${config.managerPort}`)
     console.log(`Managed ports: ${config.ports.join(', ')}`)
+
+    const githubStatus = describeGitHubConfig(githubConfig)
+    console.log(
+      githubStatus.configured
+        ? `GitHub uploads enabled: ${githubStatus.repo} (branch ${githubStatus.branch}, path ${githubStatus.resultsPath || '<repository root>'})`
+        : `GitHub uploads disabled: ${githubStatus.message}`,
+    )
   })
 
   const shutdown = () => {

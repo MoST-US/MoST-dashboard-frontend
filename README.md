@@ -7,8 +7,9 @@ Frontend dashboard for visualizing experiment data served by MoST-API.
 - Header with LLM name and GPU used (fetched from API)
 - Experiment list on the left with selection highlight
 - Per-experiment ZIP download including only `results.csv` files, preserving iteration folder structure
+- Two formats behind the download icon of the Experiments Matrix / Additive Experiments header, which opens a small menu (`aria-haspopup="menu"`, closed on an outside click, on `Escape` or after choosing an entry; both entries share the busy state and the download guard): *ZIP (folder structure)* builds `<results source>-iterations-results-csv.zip` in the browser, one `results.csv` per iteration inside `<experiment>/<iteration>/`; *Merged CSV (single file)* downloads `<results source>-iterations-results-merged.csv` from `GET /api/experiments/download/merged-results.csv?resultsScope=...&experiments=...`, one row per iteration with the experiment folder in an `IDENTIFIER` column (e.g. `1-100_1-100`) and the iteration timestamp in a `DATE` column (the first non-empty `Date`/`date`/`Timestamp`/`timestamp`/`created_at` value of the row, else the iteration folder name), followed by the union of the `results.csv` columns so archives stored with different headers still merge into one file. The file is named after the archive folder of the selected results source (e.g. `Experiment_MIT_2026-09-29_10-00-00-iterations-results-merged.csv`), while the live `current` source keeps the generic `matrix-...` prefix. Both entries cover the experiments the panel shows — the interval matrix cells, or the `mix_...` sub-experiments of an additive source, which merge because the explicit `experiments` list is forwarded to the helper (it only skips `mix_...` folders when no list is given) — and are disabled while the panel has no experiments or a download is running.
 - `EXPERIMENT_TYPE` from `results.csv` is shown in the Experiments Matrix title, the chart title, and as the prefix of the absolute value of each matrix cell (for example `MST Experiments Matrix`, `MST · 1-100/1-100`, `MST: 256`). When the field is missing from a `results.csv` that has results, it defaults to `MST`; when an experiment has no results, no type is displayed and the titles stay unchanged.
-- Additive experiments (`WORKLOAD_MIXES` runs; `Experiment_MIX_*` results sources holding `mix_...` folders) replace the interval matrix with a panel that pairs a vertical list of the sub-experiments of that run with a workload-profile matrix on its right (below the list when the window is narrower than 1200px). Each list row shows the canonical mix and the absolute `LARGEST_TRUE` (prefixed with `EXPERIMENT_TYPE`), reusing the same finished/pending colors as the matrix cells. The matrix draws every input/output combination configured in `VITE_EXPERIMENT_LIST` (the dashboard mirror of the environment `TOKENS_LIST`) and leaves the combinations no mix uses blank; only the cells of the selected mix are highlighted in red with the alpha that mix assigns to them (`0.5`, `0.333333`, `1`), so the selection stays comparable across mixes; selecting a row plots that sub-experiment in the chart and the Iteration Detail table. The panel title becomes `MST Additive Experiments` and the chart title shows the canonical mix instead of the raw folder name.
+- Additive experiments (`WORKLOAD_MIXES` runs; `Experiment_MIX_*` results sources holding `mix_...` folders) replace the interval matrix with a panel that pairs a vertical list of the sub-experiments of that run with a workload-profile matrix on its right (below the list when the window is narrower than 1200px). Each list row shows the canonical mix and the absolute `LARGEST_TRUE` (prefixed with `EXPERIMENT_TYPE`), reusing the same finished/pending colors as the matrix cells. The matrix draws every input/output combination configured in `VITE_EXPERIMENT_LIST` (the dashboard mirror of the environment `TOKENS_LIST`) and leaves the combinations no mix uses blank; only the cells of the selected mix are highlighted in red with the alpha that mix assigns to them (`0.5`, `0.333333`, `1`), so the selection stays comparable across mixes; selecting a row plots that sub-experiment in the chart and the Iteration Detail table. The panel title becomes `MST Additive Experiments` and the chart title shows the canonical mix instead of the raw folder name. Its download icon downloads every `mix_...` sub-experiment of the run in both formats (ZIP and merged CSV), even though the mixes are not assembled as an interval matrix.
 - `MIT/MST results to compare` picker above the additive workload-profile matrix: it lists only the results sources of the experiment type of that run (`Experiment_MIT_*` for an MIT additive source, `Experiment_MST_*` for an MST one, never a `Experiment_MIX_*` source) and keeps the main *Results source* untouched, since it is fetched with its own `/api/experiments?resultsScope=...` calls. With a source selected, every mix gets the additivity metrics of the model, computed against that source instead of the main one: `Sigma` is the largest `LARGEST_TRUE` of the source (finished or not), `sigma(p) = Sigma / MST(p)` per profile, `expected_sigma = Σ alpha(p)·sigma(p)`, `expected_throughput = Sigma / expected_sigma`, `true_sigma = Sigma / true_throughput` (the `LARGEST_TRUE` of the mix) and `distance = (true_throughput - expected_throughput) / expected_throughput` (signed percentage, raw ratio in the tooltip). The four metrics are shown in a block under the matrix for the selected mix and repeated on every list row; a mix whose profiles are not all measured in the comparison source shows `n/a` for the expected values plus the list of the missing profiles.
 - Line chart in the center:
 	- X axis: iteration count
@@ -28,6 +29,7 @@ Frontend dashboard for visualizing experiment data served by MoST-API.
 - Per-port experiment run status shown on each API card (green bubble with "Running" when the latest slurm job is active on `squeue`, orange bubble with "Stopped" when it is not)
 - Per-card GPU count: each API card calls `GET /api/job-gpu-count?model=MODEL_ID&node=NODE&port=PORT` and shows how many GPUs the model's serving job uses (`GPUs: N`). The model, node and port are resolved from the MoST project `.env` model URL (surfaced by `GET /api/gpu-used`), falling back to the `URL`/`MODEL_USED` columns of the latest `results.csv` when no env URL is available.
 - Log viewer at the very bottom of the screen: pressing "View log" shows the last 100 lines of the latest `slurm-*.out` log via `GET /api/experiment-log?lines=100`, with a manual "Reload" button
+- GitHub upload of finished results (optional, disabled until `GITHUB_TOKEN` and `GITHUB_REPO` are set): the third entry of the Experiments Matrix / Additive Experiments download menu (`Upload to GitHub (folder structure)`) commits the finished experiments the panel lists, the `Upload` icon next to the per-experiment ZIP icon commits the selected cell or mix, and every API card gets an `Upload results` button that commits every finished experiment found on that port. All three send the same folder-style `results.csv` tree as the ZIP download (`<experiment>/<iteration>/results.csv`), so one upload is exactly one commit, and the commit itself is created by `tunnel-manager.mjs`, which keeps the GitHub token in the server-side `.env` (a `VITE_*` token would be readable by anyone loading the bundle). Only experiments whose latest `results.csv` reports `FINISHED` are uploaded, and re-uploading identical content is detected as a no-op instead of creating an empty commit.
 
 ## Install
 
@@ -98,8 +100,45 @@ The manager exposes:
 - `GET /status/:port` to report a single tunnel
 - `POST /restart` with optional JSON body `{ "port": 4001 }` to restart one tunnel
 - `POST /restart/:port` to restart one tunnel
+- `GET /github/status` to report whether a GitHub token and repository are configured
+- `POST /github/upload` to commit one upload (see *Upload Results to GitHub*)
 
-The dashboard calls these endpoints to show per-port status, switch API view across ports, and restart each tunnel from the UI.
+The dashboard calls these endpoints to show per-port status, switch API view across ports, restart each tunnel from the UI, and commit finished results to GitHub.
+
+## Upload Results to GitHub
+
+The three upload entry points commit finished `results.csv` files to a results repository, one commit per upload:
+
+```text
+<GITHUB_RESULTS_PATH>/<model>-<gpuType>-<N>gpus/<experiment>/<sub-experiment>/<iteration>/results.csv
+```
+
+The `<experiment>` level names the experiment the results belong to: the results source the files were read from, which is the archive folder of a finished run (`Experiment_<EXPERIMENT_TYPE>_<timestamp>` / `Experiment_MIX_<EXPERIMENT_TYPE>_<timestamp>`, for example `Experiment_MIT_2026-09-29_10-00-00`). It is what keeps the sub-experiments of two runs apart, because two archives normally reuse the same cell names (`1-100_1-100`).
+
+- *Upload to GitHub (folder structure)* in the download menu of the Experiments Matrix / Additive Experiments header: every finished sub-experiment of every completed results source of the port the dashboard is connected to, in one commit — all interval matrix cells, or all `mix_...` sub-experiments of the additive runs. The ongoing `current` folder is not part of it: the matrix of a run that is still executing can still change, and the archive that run becomes is uploaded by the next upload once it ends.
+- The `Upload` icon next to the per-experiment ZIP icon: every finished sub-experiment of the panel the dashboard is showing at once — all matrix cells, or all `mix_...` sub-experiments of the additive source — read from the selected results source, which names the experiment level of the commit. A sub-experiment that has not finished yet is skipped and reported instead of blocking the rest. The icon is disabled while the panel shows the ongoing `current` results folder: that folder has no archive name yet, so there is nothing to name the experiment after.
+- *Upload results* on an API card: every finished sub-experiment of every completed results source of that port, in one commit, whether or not the dashboard is currently viewing that port. The ongoing `current` folder is skipped here as well.
+
+The folder is named after the model, the GPU type of the node that served it and the number of GPUs of the serving job, for example `results/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B-A40-2gpus/Experiment_MST_2026-09-29_10-00-00/1-100_100-300/2026-09-29_10-00-00/results.csv`. The GPU type is resolved from the results.csv host through `GPU_TYPE_MAP`; if the host is not mapped, or if the GPU count cannot be detected, the dashboard asks for it (once per port per session) instead of guessing.
+
+Configure it in `.env` (these values are read by `tunnel-manager.mjs`, not by the browser):
+
+```env
+GITHUB_TOKEN=github_pat_...
+GITHUB_REPO=owner/results-repository
+GITHUB_BRANCH=main
+GITHUB_RESULTS_PATH=results
+GPU_TYPE_MAP=A30:gpu01:gpu02,A40:gpu03:gpu04:gpu05:gpu06,A100:gpu07:gpu08
+```
+
+- `GITHUB_TOKEN`: fine-grained personal access token with *Contents: Read and write* on that repository only. Keep it out of `VITE_*` variables.
+- `GITHUB_REPO`: `owner/repository`. A full `https://github.com/owner/repository` URL is also accepted.
+- `GITHUB_BRANCH`: created from the first upload when it does not exist yet.
+- `GITHUB_RESULTS_PATH`: folder holding the uploads. Leave it empty to commit at the repository root.
+- `GITHUB_API_BASE_URL`: GitHub Enterprise API base URL (`https://github.example.com/api/v3`), optional.
+- `GPU_TYPE_MAP`: `type:node:node,...` mapping of the cluster nodes to their GPU type.
+
+Uploads are disabled (with the reason in the tooltip) while `GITHUB_TOKEN` or `GITHUB_REPO` are missing, and only experiments whose latest `results.csv` reports `FINISHED` are uploaded, and only from a results source that already ended (an `Experiment_*` archive; the matrix icon additionally requires the panel to show such an archive and is disabled while the ongoing `current` folder is selected, because that folder has no archive name yet). Every upload names the experiment level after the archive it read, so the iterations of `1-100_100-300` of two runs land in two different experiment folders — `results/<model>-<gpuType>-<N>gpus/<archive>/1-100_100-300/<iteration>/results.csv` — in chronological order within each one, and a commit that sweeps several archives writes one experiment folder per archive. Every experiment of a port is uploaded under the folder of the model/GPU the port serves *now*, so an experiment left behind by an earlier model on the same port is placed under the current model folder. Sweeping a long history into one commit is bounded by the uploader limits (`MAX_UPLOAD_FILES` / `MAX_UPLOAD_TOTAL_BYTES`, 5000 files / 64 MB per commit): a history larger than that is rejected and has to be uploaded in smaller steps. Identical content produces no commit: the button reports that the repository already has those results.
 
 ## Manual SSH Tunnel Example (optional)
 

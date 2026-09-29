@@ -11,7 +11,7 @@ import {
 } from 'recharts'
 import JSZip from 'jszip'
 import { saveAs } from 'file-saver'
-import { Download, FileDown, RefreshCw, RotateCcw, Terminal } from 'lucide-react'
+import { Download, FileDown, RefreshCw, RotateCcw, Terminal, Upload } from 'lucide-react'
 import './App.css'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000'
@@ -666,6 +666,85 @@ function formatResultsScopeLabel(scope) {
   return scope
 }
 
+// Labels the commit of an upload that covers a whole set of results sources at once: the archive name
+// when there is exactly one (`Experiment_MIT_2026-09-29_10-00-00`), otherwise how many archives the
+// commit merges. The live `current` source is never part of such a set (see
+// collectFinishedExperimentsFromCompletedSources).
+function formatUploadScopesLabel(resultsScopes) {
+  const labels = [...new Set((resultsScopes || []).filter(Boolean).map(formatResultsScopeLabel))]
+  if (labels.length === 0) {
+    return ''
+  }
+
+  if (labels.length === 1) {
+    return labels[0]
+  }
+
+  return `${labels.length} results sources`
+}
+
+// Shown when an upload is attempted while the panel views the still-running `current` results folder.
+// That folder has no archive name yet, so it cannot name the experiment level of the repository folder
+// the upload creates (see buildUploadExperimentFolder); the server refuses such an upload as well.
+const CURRENT_SCOPE_UPLOAD_MESSAGE =
+  'The ongoing "current" results source has no experiment name yet, so its sub-experiments cannot be uploaded. Upload the Experiment_* archive the run becomes once it ends.'
+
+// The experiment level of an upload folder is the results source the files were read from, i.e. the
+// archive folder of a finished run (`Experiment_<TYPE>_<timestamp>` /
+// `Experiment_MIX_<TYPE>_<timestamp>`, for example `Experiment_MIT_2026-09-29_10-00-00`). The live
+// `current` folder has no archive name yet, so it returns null, which is what blocks its upload.
+function buildUploadExperimentFolder(resultsScope) {
+  const normalized = String(resultsScope || '').trim()
+  if (!normalized || normalized === DEFAULT_RESULTS_SCOPE) {
+    return null
+  }
+
+  return normalized
+}
+
+// Tooltip of the matrix upload button, which covers a whole panel: every cell of the interval matrix,
+// or every `mix_...` sub-experiment of an additive source. `scopeUploadable` is false while the panel
+// shows the `current` results folder, which cannot name the experiment level of the upload.
+function buildMatrixUploadTitle(configured, isAdditiveMode, message, scopeUploadable = true) {
+  if (!configured) {
+    return message || 'GitHub uploads are not configured.'
+  }
+
+  if (!scopeUploadable) {
+    return CURRENT_SCOPE_UPLOAD_MESSAGE
+  }
+
+  return isAdditiveMode
+    ? 'Upload every finished mix of this additive source to GitHub'
+    : 'Upload every finished cell of this matrix to GitHub'
+}
+
+// Screen-reader label of the matrix upload button, mirroring its tooltip: the reason when the panel
+// shows the upload-blocking `current` source, otherwise what the button covers.
+function buildMatrixUploadAriaLabel(isAdditiveMode, scopeUploadable) {
+  if (!scopeUploadable) {
+    return CURRENT_SCOPE_UPLOAD_MESSAGE
+  }
+
+  return isAdditiveMode
+    ? 'Upload every finished mix of this additive source to GitHub'
+    : 'Upload every finished cell of this matrix to GitHub'
+}
+
+// The matrix/additive downloads cover a whole results source, so they are named after its archive
+// folder (`Experiment_<TYPE>_<timestamp>` / `Experiment_MIX_<TYPE>_<timestamp>`, for example
+// `Experiment_MIT_2026-09-29_10-00-00`). The live `current` results folder holds no archive name,
+// so it keeps the generic `matrix` prefix; characters a filesystem may reject are replaced anyway,
+// since the value is only ever used as a download name.
+function buildResultsDownloadBaseName(scope) {
+  const normalized = String(scope || '').trim()
+  if (!normalized || normalized === DEFAULT_RESULTS_SCOPE) {
+    return 'matrix'
+  }
+
+  return normalized.replace(/[\\/:*?"<>|]/g, '-')
+}
+
 function getHeatmapColor(value, min, max) {
   if (!Number.isFinite(value)) {
     return '#ffffff'
@@ -892,6 +971,204 @@ async function fetchGpuCountForPort(port, resultsScope, modelUrl, fallbackModelI
   return null
 }
 
+// Values the API-related helpers report when they could not resolve something. They must never end up
+// in an upload folder name or in a GitHub commit message.
+const UPLOAD_UNAVAILABLE_VALUES = new Set([
+  '',
+  'unavailable',
+  'loading...',
+  'unknown',
+  'unknown model',
+  'n/a',
+  'null',
+  'undefined',
+])
+
+const MAX_UPLOAD_GPU_COUNT = 64
+
+function isUsableUploadValue(value) {
+  if (value === null || value === undefined) {
+    return false
+  }
+
+  return !UPLOAD_UNAVAILABLE_VALUES.has(String(value).trim().toLowerCase())
+}
+
+// Uploads are restricted to finished experiments: only those have a complete results.csv series.
+function isFinishedExperiment(status) {
+  return Boolean(status?.finished)
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : ''
+      const separator = result.indexOf(',')
+      resolve(separator === -1 ? '' : result.slice(separator + 1))
+    }
+    reader.onerror = () => reject(new Error('Unable to read the results file.'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+// The GitHub upload sends exactly the folder-style tree the ZIP download builds, so both paths share
+// this collector: one `<sub-experiment>/<iteration>/results.csv` entry per iteration, base64-encoded
+// because it travels inside a JSON body. Every entry also carries the experiment (results source) it
+// was read from, because that is the folder level the upload names after the experiment; the ZIP
+// download ignores the field and keeps using `path` alone.
+async function collectExperimentResultFiles(experiment, port, resultsScope) {
+  const iterationResponse = await fetchJson(
+    `/api/experiments/${encodeURIComponent(experiment)}/iterations`,
+    port,
+    { resultsScope },
+  )
+  const iterations = iterationResponse.iterations || []
+  const files = []
+  const experimentFolder = buildUploadExperimentFolder(resultsScope)
+
+  for (const iterationName of iterations) {
+    const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/results.csv`
+    const response = await fetch(buildApiUrl(endpoint, port, { resultsScope }))
+    if (!response.ok) {
+      continue
+    }
+
+    const contentBase64 = await blobToBase64(await response.blob())
+    if (!contentBase64) {
+      continue
+    }
+
+    files.push({
+      path: `${experiment}/${iterationName}/results.csv`,
+      experimentFolder,
+      contentBase64,
+    })
+  }
+
+  return files
+}
+
+// Everything the port currently exposes (interval pairs and additive `mix_...` folders), split by the
+// FINISHED flag of each experiment's latest results.csv.
+async function collectFinishedExperimentsForPort(port, resultsScope) {
+  const data = await fetchJson('/api/experiments', port, { resultsScope })
+  const additiveNames = (data.additiveExperiments || []).map((entry) => entry?.name)
+  const names = [...new Set([...(data.experiments || []), ...additiveNames])].filter(Boolean)
+  const statuses = await Promise.all(
+    names.map(async (name) => [name, await fetchExperimentStatus(name, port, resultsScope)]),
+  )
+
+  const finished = []
+  const skipped = []
+
+  for (const [name, status] of statuses) {
+    if (isFinishedExperiment(status)) {
+      finished.push(name)
+    } else {
+      skipped.push(name)
+    }
+  }
+
+  return { finished, skipped }
+}
+
+// Results sources that only hold archives of runs that already ended. `current` is the folder of the
+// execution that is still running: its cells can still be added or rewritten, so it is never uploaded
+// on its own; the archive it becomes is picked up by the next upload once that run ends. The scopes are
+// always fetched for the given port, which is not necessarily the port the dashboard is viewing.
+async function fetchCompletedResultsScopes(port) {
+  const data = await fetchJson('/api/results-scopes', port)
+  const scopes = Array.isArray(data.scopes) ? data.scopes : []
+
+  return [...new Set(scopes)].filter((scope) => scope && scope !== DEFAULT_RESULTS_SCOPE)
+}
+
+// The finished sub-experiments (interval pairs and additive `mix_...` folders) of every completed
+// results source of the port, each one paired with the archive it was read from. Two archives hold the
+// same cell names, so the source has to travel with every entry: the upload names the experiment level
+// after it, which is what keeps the iterations of `1-100_100-300` of two runs apart in the repository.
+async function collectFinishedExperimentsFromCompletedSources(port) {
+  const resultsScopes = await fetchCompletedResultsScopes(port)
+  const experiments = []
+  const skipped = []
+
+  for (const resultsScope of resultsScopes) {
+    const collected = await collectFinishedExperimentsForPort(port, resultsScope)
+    collected.finished.forEach((name) => experiments.push({ name, resultsScope }))
+    collected.skipped.forEach((name) => skipped.push({ name, resultsScope }))
+  }
+
+  return { resultsScopes, experiments, skipped }
+}
+
+// One upload can span several results sources, so every experiment travels with the source it has to be
+// read from. A bare name keeps the single-source behavior by falling back to the source the dashboard
+// currently shows, and a repeated `source`+`name` pair (the panel lists a cell once) is collapsed.
+function normalizeUploadExperimentEntries(experiments, fallbackResultsScope) {
+  const entries = []
+  const seen = new Set()
+
+  for (const experiment of experiments || []) {
+    const name = typeof experiment === 'string' ? experiment : experiment?.name
+    if (!name) {
+      continue
+    }
+
+    const resultsScope =
+      typeof experiment === 'string' || !experiment.resultsScope
+        ? fallbackResultsScope
+        : experiment.resultsScope
+    const key = `${resultsScope}::${name}`
+    if (seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    entries.push({ name, resultsScope })
+  }
+
+  return entries
+}
+
+function buildUploadCommitMessage({ model, experimentCount, fileCount, sourceLabel }) {
+  const scope = sourceLabel ? ` (${sourceLabel})` : ''
+  const experimentLabel = experimentCount === 1 ? 'experiment' : 'experiments'
+  return `Add ${experimentCount} ${experimentLabel} from ${model}: ${fileCount} results.csv file(s) via MoST-dashboard${scope}`
+}
+
+async function fetchGitHubUploadStatus() {
+  const response = await fetch(buildTunnelUrl('/github/status'))
+  if (!response.ok) {
+    throw new Error(`GitHub status request failed (HTTP ${response.status}).`)
+  }
+
+  return response.json()
+}
+
+// The commit is created by the tunnel manager, which is the only process that ever sees the GitHub
+// token (it lives in the server-side .env, never in this bundle).
+async function requestGitHubUpload({ model, node, gpuCount, files, commitMessage }) {
+  const response = await fetch(buildTunnelUrl('/github/upload'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, node, gpuCount, commitMessage, files }),
+  })
+
+  let payload = null
+  try {
+    payload = await response.json()
+  } catch {
+    payload = null
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error || `The GitHub upload failed (HTTP ${response.status}).`)
+  }
+
+  return payload || {}
+}
+
 function CustomNode({ cx, cy, payload, onHover, onHoverEnd, onSelect }) {
   if (!payload || cx === undefined || cy === undefined) {
     return null
@@ -994,6 +1271,9 @@ function ComparisonMetrics({ comparison, only = COMPARISON_METRIC_LABELS }) {
 
 function App() {
   const chartWrapperRef = useRef(null)
+  // Popover of the matrix download icon: the ZIP keeps the folder structure, the merged CSV is a
+  // single file built by the API (see downloadMatrixMergedCsv below).
+  const matrixDownloadMenuRef = useRef(null)
   const [activeApiPort, setActiveApiPort] = useState(CONFIGURED_API_PORTS[0])
   const [resultsScopeOptions, setResultsScopeOptions] = useState([DEFAULT_RESULTS_SCOPE])
   const [selectedResultsScope, setSelectedResultsScope] = useState(DEFAULT_RESULTS_SCOPE)
@@ -1009,6 +1289,7 @@ function App() {
   const [errorMessage, setErrorMessage] = useState('')
   const [busyExperimentDownload, setBusyExperimentDownload] = useState('')
   const [busyMatrixDownload, setBusyMatrixDownload] = useState(false)
+  const [matrixDownloadMenuOpen, setMatrixDownloadMenuOpen] = useState(false)
   const [experimentStatuses, setExperimentStatuses] = useState({})
   const [loadingMatrixStatus, setLoadingMatrixStatus] = useState(false)
   // MIT/MST results source the additive panel compares its mixes against. It is used only by the
@@ -1032,6 +1313,18 @@ function App() {
   const [logLoading, setLogLoading] = useState(false)
   const [logError, setLogError] = useState('')
   const [logReloadKey, setLogReloadKey] = useState(0)
+  const [githubStatus, setGitHubStatus] = useState({
+    loading: true,
+    configured: false,
+    repo: '',
+    branch: '',
+    resultsPath: '',
+    message: '',
+  })
+  const [uploadBusyKey, setUploadBusyKey] = useState('')
+  const [uploadNotice, setUploadNotice] = useState(null)
+  // Answers given through the GPU-count prompt, remembered per port for the rest of the session.
+  const uploadGpuCountOverridesRef = useRef({})
 
   useEffect(() => {
     let isMounted = true
@@ -1397,6 +1690,31 @@ function App() {
     return [...new Set(entries)]
   }, [matrixModel])
 
+  // The header download menu covers whatever the panel shows: the interval matrix cells, or the
+  // `mix_...` sub-experiments of an additive (Experiment_MIX_*) source. Those mixes are not matrix
+  // cells, but their `results.csv` files download the same way: the merged CSV helper merges any
+  // explicitly requested folder, additive ones included.
+  const downloadableExperiments = useMemo(
+    () =>
+      matrixExperiments.length > 0
+        ? matrixExperiments
+        : additiveExperiments.map((entry) => entry.name),
+    [matrixExperiments, additiveExperiments],
+  )
+
+  // Only finished experiments can be uploaded: their results.csv series is complete. The experiment
+  // level of the uploaded folder tree is named after the results source the panel reads, so the live
+  // `current` folder (no archive name yet) can only be uploaded once the run ends and it becomes an
+  // `Experiment_*` archive.
+  const finishedDownloadableExperiments = useMemo(
+    () =>
+      downloadableExperiments.filter((experiment) =>
+        isFinishedExperiment(experimentStatuses[experiment]),
+      ),
+    [downloadableExperiments, experimentStatuses],
+  )
+  const viewedScopeUploadable = buildUploadExperimentFolder(selectedResultsScope) !== null
+
   const matrixExperimentType = useMemo(() => {
     const types = Object.values(experimentStatuses)
       .map((status) => status?.experimentType)
@@ -1641,30 +1959,21 @@ function App() {
     }
   }
 
+  // The ZIP download and the GitHub upload read the results the same way, so both go through
+  // `collectExperimentResultFiles`: a folder tree of `<sub-experiment>/<iteration>/results.csv`. The ZIP
+  // keeps that tree (the experiment level is only added to the repository path by the upload).
   async function appendExperimentCsvToZip(experiment, zip) {
-    const iterationResponse = await fetchJson(
-      `/api/experiments/${encodeURIComponent(experiment)}/iterations`,
+    const files = await collectExperimentResultFiles(
+      experiment,
       activeApiPort,
-      { resultsScope: selectedResultsScope },
+      selectedResultsScope,
     )
-    const iterations = iterationResponse.iterations || []
-    let fileCount = 0
 
-    for (const iterationName of iterations) {
-      const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/results.csv`
-      const response = await fetch(
-        buildApiUrl(endpoint, activeApiPort, { resultsScope: selectedResultsScope }),
-      )
-      if (!response.ok) {
-        continue
-      }
-
-      const csvBlob = await response.blob()
-      zip.file(`${experiment}/${iterationName}/results.csv`, csvBlob)
-      fileCount += 1
+    for (const file of files) {
+      zip.file(file.path, file.contentBase64, { base64: true })
     }
 
-    return fileCount
+    return files.length
   }
 
   async function downloadExperimentCsvZip(experiment) {
@@ -1696,15 +2005,15 @@ function App() {
     setErrorMessage('')
 
     try {
-      if (matrixExperiments.length === 0) {
-        setErrorMessage('No matrix experiments available to download.')
+      if (downloadableExperiments.length === 0) {
+        setErrorMessage('No experiments available to download.')
         return
       }
 
       const zip = new JSZip()
       let fileCount = 0
 
-      for (const experiment of matrixExperiments) {
+      for (const experiment of downloadableExperiments) {
         try {
           fileCount += await appendExperimentCsvToZip(experiment, zip)
         } catch {
@@ -1713,17 +2022,365 @@ function App() {
       }
 
       if (fileCount === 0) {
-        setErrorMessage('No results.csv files found for the matrix.')
+        setErrorMessage('No results.csv files found in the selected results source.')
         return
       }
 
       const zipBlob = await zip.generateAsync({ type: 'blob' })
-      saveAs(zipBlob, 'matrix-iterations-results-csv.zip')
+      saveAs(zipBlob, `${buildResultsDownloadBaseName(selectedResultsScope)}-iterations-results-csv.zip`)
     } catch {
       setErrorMessage(`Unable to build matrix zip on port ${activeApiPort}.`)
     } finally {
       setBusyMatrixDownload(false)
     }
+  }
+
+  // Merged single-file variant of the ZIP download: the API runs MergeResultsCsv.py over the same
+  // experiments (matrix cells, or the `mix_...` sub-experiments of an additive source) and streams
+  // back one CSV, with the experiment name in `IDENTIFIER` and the iteration timestamp in `DATE`.
+  async function downloadMatrixMergedCsv() {
+    if (busyMatrixDownload) {
+      return
+    }
+
+    if (downloadableExperiments.length === 0) {
+      setErrorMessage('No experiments available to download.')
+      return
+    }
+
+    setBusyMatrixDownload(true)
+    setErrorMessage('')
+
+    try {
+      const response = await fetch(
+        buildApiUrl('/api/experiments/download/merged-results.csv', activeApiPort, {
+          resultsScope: selectedResultsScope,
+          experiments: downloadableExperiments.join(','),
+        }),
+      )
+      if (!response.ok) {
+        throw new Error('Merged CSV download failed.')
+      }
+
+      const blob = await response.blob()
+      saveAs(blob, `${buildResultsDownloadBaseName(selectedResultsScope)}-iterations-results-merged.csv`)
+    } catch {
+      setErrorMessage(`Unable to build merged CSV on port ${activeApiPort}.`)
+    } finally {
+      setBusyMatrixDownload(false)
+    }
+  }
+
+  // The GPU count names the upload folder (`<model>-<gpuType>-<N>gpus`). `/api/job-gpu-count` cannot
+  // answer for results whose job is long gone and whose results.csv has no GPU column, so the
+  // operator is asked once per port and the answer is reused for the rest of the session.
+  async function resolveUploadGpuCount(port, model, node, identity) {
+    if (Number.isInteger(identity?.gpuCount) && identity.gpuCount > 0) {
+      return identity.gpuCount
+    }
+
+    const remembered = uploadGpuCountOverridesRef.current[port]
+    if (Number.isInteger(remembered) && remembered > 0) {
+      return remembered
+    }
+
+    const detected = await fetchGpuCountForPort(
+      port,
+      selectedResultsScope,
+      identity?.modelUrl,
+      model,
+    )
+    if (Number.isInteger(detected) && detected > 0) {
+      return detected
+    }
+
+    const answer = window.prompt(
+      `Could not detect how many GPUs ${model} used on ${node}.\nEnter the GPU count for the upload folder (1-${MAX_UPLOAD_GPU_COUNT}):`,
+      '',
+    )
+    if (answer === null) {
+      return null
+    }
+
+    const numeric = Number(String(answer).trim())
+    if (!Number.isInteger(numeric) || numeric < 1 || numeric > MAX_UPLOAD_GPU_COUNT) {
+      return null
+    }
+
+    uploadGpuCountOverridesRef.current[port] = numeric
+    return numeric
+  }
+
+  // Everything the tunnel manager needs to name the commit folder: the model of the serving job, the
+  // cluster node (which resolves the GPU type through GPU_TYPE_MAP) and the GPU count.
+  async function resolveUploadTarget(port, identity) {
+    const endpoint = await resolveModelEndpointForPort(
+      port,
+      selectedResultsScope,
+      identity?.modelUrl,
+    )
+
+    if (!endpoint?.node) {
+      return {
+        ok: false,
+        error: `Unable to determine the GPU host of port ${port}, so the GPU type of the upload folder cannot be mapped.`,
+      }
+    }
+
+    let model = isUsableUploadValue(identity?.llm) ? String(identity.llm).trim() : ''
+    if (!model && isUsableUploadValue(endpoint.model)) {
+      model = String(endpoint.model).trim()
+    }
+
+    if (!model) {
+      return { ok: false, error: `Unable to determine the model name of port ${port}.` }
+    }
+
+    const gpuCount = await resolveUploadGpuCount(port, model, endpoint.node, identity)
+    if (!Number.isInteger(gpuCount)) {
+      return {
+        ok: false,
+        error: `Upload cancelled: an integer GPU count between 1 and ${MAX_UPLOAD_GPU_COUNT} is required to name the folder of ${model}.`,
+      }
+    }
+
+    return { ok: true, model, node: endpoint.node, gpuCount }
+  }
+
+  // Shared by the three upload entry points: collect the folder-style results of the given experiments
+  // and commit them together, so one upload is always one commit. Every experiment travels with the
+  // results source it has to be read from, which is what lets one commit sweep several completed
+  // archives (`Experiment_*`) at once.
+  async function uploadExperimentsToGitHub({
+    port,
+    experiments,
+    busyKey,
+    identity,
+    skippedCount = 0,
+  }) {
+    if (uploadBusyKey) {
+      return
+    }
+
+    const entries = normalizeUploadExperimentEntries(experiments, selectedResultsScope)
+    if (entries.length === 0) {
+      return
+    }
+
+    // The folder tree names the experiment level after the results source, so a source without an
+    // archive name (the still-running `current` folder) cannot be uploaded at all.
+    if (entries.some((entry) => !buildUploadExperimentFolder(entry.resultsScope))) {
+      setUploadNotice(null)
+      setErrorMessage(CURRENT_SCOPE_UPLOAD_MESSAGE)
+      return
+    }
+
+    const sourceLabel = formatUploadScopesLabel(entries.map((entry) => entry.resultsScope))
+    const sourceCount = new Set(entries.map((entry) => entry.resultsScope)).size
+    const sourceLabelSuffix = sourceCount > 1 ? ` across ${sourceLabel}` : ''
+
+    setUploadBusyKey(busyKey)
+    setUploadNotice(null)
+    setErrorMessage('')
+
+    try {
+      const target = await resolveUploadTarget(port, identity)
+      if (!target.ok) {
+        setErrorMessage(target.error)
+        return
+      }
+
+      const files = []
+      let experimentCount = 0
+
+      for (const entry of entries) {
+        try {
+          const experimentFiles = await collectExperimentResultFiles(
+            entry.name,
+            port,
+            entry.resultsScope,
+          )
+          if (experimentFiles.length === 0) {
+            continue
+          }
+
+          files.push(...experimentFiles)
+          experimentCount += 1
+        } catch {
+          // A folder that cannot be read is skipped; the remaining experiments still upload.
+        }
+      }
+
+      if (files.length === 0) {
+        setErrorMessage(`No results.csv files found to upload for port ${port}.`)
+        return
+      }
+
+      const result = await requestGitHubUpload({
+        model: target.model,
+        node: target.node,
+        gpuCount: target.gpuCount,
+        commitMessage: buildUploadCommitMessage({
+          model: target.model,
+          experimentCount,
+          fileCount: files.length,
+          sourceLabel,
+        }),
+        files,
+      })
+
+      const targetPath = result.folderPath || result.folder
+      const experimentFolders = Array.isArray(result.experimentFolders) ? result.experimentFolders : []
+      // The experiment level is part of where the files landed: the notice shows the full path when the
+      // upload covered a single archive, and counts the folders when it swept several archives.
+      let targetLabel = targetPath
+      if (experimentFolders.length === 1) {
+        targetLabel = `${targetPath}/${experimentFolders[0]}`
+      } else if (experimentFolders.length > 1) {
+        targetLabel = `${targetPath} (${experimentFolders.length} experiment folders)`
+      }
+      const skippedLabel =
+        skippedCount > 0 ? ` ${skippedCount} unfinished experiment(s) were skipped.` : ''
+
+      setUploadNotice({
+        text: result.unchanged
+          ? `GitHub already had this content in ${targetLabel}; no new commit was created.${skippedLabel}`
+          : `Uploaded ${result.fileCount} file(s) from ${experimentCount} experiment(s)${sourceLabelSuffix} to ${result.repo} (${targetLabel} on ${result.branch}).${skippedLabel}`,
+        commitUrl: result.commitUrl || '',
+        commitLabel: result.commitSha ? result.commitSha.slice(0, 7) : '',
+        unchanged: Boolean(result.unchanged),
+      })
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : `Unable to upload the results of port ${port} to GitHub.`,
+      )
+    } finally {
+      setUploadBusyKey('')
+    }
+  }
+
+  // Panel menu entry: every finished sub-experiment of every completed results source of the port the
+  // dashboard is connected to — the interval matrix cells, or the `mix_...` sub-experiments of an
+  // additive source. The ongoing `current` source is not part of that set: the matrix of a run that is
+  // still executing may still change, so the archive it becomes is uploaded once the run ends.
+  async function uploadPanelResultsToGitHub() {
+    if (uploadBusyKey) {
+      return
+    }
+
+    setUploadBusyKey('matrix-completed')
+    setUploadNotice(null)
+    setErrorMessage('')
+
+    let collected = { resultsScopes: [], experiments: [], skipped: [] }
+
+    try {
+      collected = await collectFinishedExperimentsFromCompletedSources(activeApiPort)
+    } catch {
+      setUploadBusyKey('')
+      setErrorMessage(
+        `Unable to list the completed results sources of port ${activeApiPort} for the upload.`,
+      )
+      return
+    }
+
+    setUploadBusyKey('')
+
+    if (collected.experiments.length === 0) {
+      setErrorMessage(
+        `Only finished experiments can be uploaded. No finished experiment was found in the completed results sources of port ${activeApiPort}.`,
+      )
+      return
+    }
+
+    await uploadExperimentsToGitHub({
+      port: activeApiPort,
+      experiments: collected.experiments,
+      busyKey: 'matrix-completed',
+      identity: portIdentityByPort[activeApiPort],
+      skippedCount: collected.skipped.length,
+    })
+  }
+
+  // Matrix button: the whole matrix the panel shows — every matrix cell, or every `mix_...`
+  // sub-experiment of an additive source — instead of only the selected one, in one commit, read from
+  // the results source the dashboard is viewing. FINISHED is what makes a sub-experiment uploadable,
+  // so the cells of a run that is still in progress are skipped instead of blocking the rest; a
+  // completed archive is covered in full by the menu entry above. The experiment level of the committed
+  // folder tree is named after that results source, so the button only works while the panel shows an
+  // archive: the still-running `current` folder has no name to give (see buildUploadExperimentFolder).
+  async function uploadMatrixResultsToGitHub() {
+    if (!viewedScopeUploadable) {
+      setUploadNotice(null)
+      setErrorMessage(CURRENT_SCOPE_UPLOAD_MESSAGE)
+      return
+    }
+
+    if (finishedDownloadableExperiments.length === 0) {
+      setUploadNotice(null)
+      setErrorMessage(
+        'Only finished experiments can be uploaded. No finished experiment was found in the selected results source.',
+      )
+      return
+    }
+
+    await uploadExperimentsToGitHub({
+      port: activeApiPort,
+      experiments: finishedDownloadableExperiments,
+      busyKey: 'matrix-viewed',
+      identity: portIdentityByPort[activeApiPort],
+      skippedCount: downloadableExperiments.length - finishedDownloadableExperiments.length,
+    })
+  }
+
+  // Per-tunnel button: every finished sub-experiment of every completed results source of the port, in
+  // a single commit. The ongoing `current` source is not part of that set (see
+  // collectFinishedExperimentsFromCompletedSources), so a run that is still executing is never
+  // committed halfway: the archive it becomes is uploaded once the run ends. This works for a port the
+  // dashboard is not currently viewing as well, since the sources are listed for that port.
+  async function uploadTunnelResultsToGitHub(port) {
+    if (uploadBusyKey) {
+      return
+    }
+
+    setUploadBusyKey(`port:${port}`)
+    setUploadNotice(null)
+    setErrorMessage('')
+
+    let collected = { resultsScopes: [], experiments: [], skipped: [] }
+
+    try {
+      collected = await collectFinishedExperimentsFromCompletedSources(port)
+    } catch {
+      setUploadBusyKey('')
+      setErrorMessage(
+        `Unable to list the completed results sources of port ${port} for the upload.`,
+      )
+      return
+    }
+
+    setUploadBusyKey('')
+
+    if (collected.experiments.length === 0) {
+      setErrorMessage(
+        `No finished experiment with results was found in the completed results sources of port ${port}${
+          collected.skipped.length > 0
+            ? ` (${collected.skipped.length} unfinished experiment(s) skipped)`
+            : ''
+        }.`,
+      )
+      return
+    }
+
+    await uploadExperimentsToGitHub({
+      port,
+      experiments: collected.experiments,
+      busyKey: `port:${port}`,
+      identity: portIdentityByPort[port],
+      skippedCount: collected.skipped.length,
+    })
   }
 
   async function restartTunnel(port) {
@@ -1757,6 +2414,32 @@ function App() {
     const merged = [...CONFIGURED_API_PORTS, ...tunnelState.tunnels.map((entry) => entry.port)]
     return [...new Set(merged)]
   }, [tunnelState.tunnels])
+
+  // The matrix download icon now opens a two-entry menu, so it has to close like a popover.
+  useEffect(() => {
+    if (!matrixDownloadMenuOpen) {
+      return undefined
+    }
+
+    function handlePointerDown(event) {
+      if (matrixDownloadMenuRef.current && !matrixDownloadMenuRef.current.contains(event.target)) {
+        setMatrixDownloadMenuOpen(false)
+      }
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === 'Escape') {
+        setMatrixDownloadMenuOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [matrixDownloadMenuOpen])
 
   useEffect(() => {
     let isCancelled = false
@@ -1865,6 +2548,50 @@ function App() {
       clearInterval(timer)
     }
   }, [visiblePorts, selectedResultsScope])
+
+  // `GET /github/status` only reports whether a token and a repository are configured; the token itself
+  // never reaches this bundle. Re-checking when the manager becomes reachable again keeps the upload
+  // buttons honest after the manager restarts with different .env values.
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadGitHubStatus() {
+      try {
+        const data = await fetchGitHubUploadStatus()
+        if (isCancelled) {
+          return
+        }
+
+        setGitHubStatus({
+          loading: false,
+          configured: Boolean(data.configured),
+          repo: data.repo || '',
+          branch: data.branch || '',
+          resultsPath: data.resultsPath || '',
+          message: data.message || '',
+        })
+      } catch {
+        if (isCancelled) {
+          return
+        }
+
+        setGitHubStatus({
+          loading: false,
+          configured: false,
+          repo: '',
+          branch: '',
+          resultsPath: '',
+          message: 'The tunnel manager is unreachable, so GitHub uploads are unavailable.',
+        })
+      }
+    }
+
+    loadGitHubStatus()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [tunnelState.reachable])
 
   useEffect(() => {
     if (!logVisible) {
@@ -2047,6 +2774,28 @@ function App() {
                     <RotateCcw size={16} />
                     {restartBusy ? 'Restarting...' : 'Restart tunnel'}
                   </button>
+                  <button
+                    type="button"
+                    className="tunnel-upload"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      uploadTunnelResultsToGitHub(port)
+                    }}
+                    disabled={
+                      !githubStatus.configured ||
+                      tunnelTone === 'down' ||
+                      restartBusy ||
+                      Boolean(uploadBusyKey)
+                    }
+                    title={
+                      githubStatus.configured
+                        ? `Upload every finished experiment of every completed results source of port ${port} to GitHub in one commit`
+                        : githubStatus.message || 'GitHub uploads are not configured.'
+                    }
+                  >
+                    <Upload size={16} />
+                    {uploadBusyKey === `port:${port}` ? 'Uploading...' : 'Upload results'}
+                  </button>
                 </div>
               </div>
             )
@@ -2055,6 +2804,19 @@ function App() {
       </section>
 
       {errorMessage && <div className="error-banner">{errorMessage}</div>}
+
+      {uploadNotice && (
+        <div className="upload-banner" role="status">
+          <span>{uploadNotice.text}</span>
+          {uploadNotice.commitUrl && (
+            <a href={uploadNotice.commitUrl} target="_blank" rel="noreferrer">
+              {uploadNotice.unchanged
+                ? `Existing commit ${uploadNotice.commitLabel}`
+                : `Commit ${uploadNotice.commitLabel}`}
+            </a>
+          )}
+        </div>
+      )}
 
       <main className={`dashboard-main ${isAdditiveMode ? 'is-additive' : ''}`}>
         <aside className="experiment-panel">
@@ -2067,24 +2829,74 @@ function App() {
                   : 'Experiments Matrix'}
             </h2>
             <div className="button-group">
-              <button
-                type="button"
-                className="icon-button"
-                onClick={downloadMatrixCsvZip}
-                title={
-                  isAdditiveMode
-                    ? 'Matrix CSV zip is unavailable for additive results'
-                    : 'Download matrix CSV zip'
-                }
-                aria-label={
-                  isAdditiveMode
-                    ? 'Matrix CSV zip is unavailable for additive results'
-                    : 'Download matrix CSV zip'
-                }
-                disabled={matrixExperiments.length === 0 || busyMatrixDownload}
-              >
-                <Download size={16} />
-              </button>
+              <div className="download-menu-wrapper" ref={matrixDownloadMenuRef}>
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => setMatrixDownloadMenuOpen((previous) => !previous)}
+                  title={
+                    isAdditiveMode ? 'Download additive results' : 'Download matrix results'
+                  }
+                  aria-label={
+                    isAdditiveMode ? 'Download additive results' : 'Download matrix results'
+                  }
+                  aria-haspopup="menu"
+                  aria-expanded={matrixDownloadMenuOpen}
+                  data-active={matrixDownloadMenuOpen}
+                  disabled={downloadableExperiments.length === 0 || busyMatrixDownload}
+                >
+                  <Download size={16} />
+                </button>
+                {matrixDownloadMenuOpen && (
+                  <div className="download-menu" role="menu">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="download-menu-item"
+                      onClick={() => {
+                        setMatrixDownloadMenuOpen(false)
+                        downloadMatrixCsvZip()
+                      }}
+                    >
+                      ZIP (folder structure)
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="download-menu-item"
+                      onClick={() => {
+                        setMatrixDownloadMenuOpen(false)
+                        downloadMatrixMergedCsv()
+                      }}
+                    >
+                      Merged CSV (single file)
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="download-menu-item"
+                      onClick={() => {
+                        setMatrixDownloadMenuOpen(false)
+                        uploadPanelResultsToGitHub()
+                      }}
+                      disabled={
+                        !githubStatus.configured ||
+                        uploadBusyKey !== '' ||
+                        busyMatrixDownload
+                      }
+                      title={
+                        githubStatus.configured
+                          ? 'Upload every finished experiment of every completed results source to GitHub'
+                          : githubStatus.message || 'GitHub uploads are not configured.'
+                      }
+                    >
+                      {uploadBusyKey === 'matrix-completed'
+                        ? 'Uploading to GitHub...'
+                        : 'Upload to GitHub (folder structure)'}
+                    </button>
+                  </div>
+                )}
+              </div>
               <button
                 type="button"
                 className="icon-button"
@@ -2096,6 +2908,27 @@ function App() {
                 disabled={!selectedExperiment || busyExperimentDownload === selectedExperiment}
               >
                 <FileDown size={16} />
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={uploadMatrixResultsToGitHub}
+                title={buildMatrixUploadTitle(
+                  githubStatus.configured,
+                  isAdditiveMode,
+                  githubStatus.message,
+                  viewedScopeUploadable,
+                )}
+                aria-label={buildMatrixUploadAriaLabel(isAdditiveMode, viewedScopeUploadable)}
+                disabled={
+                  !githubStatus.configured ||
+                  uploadBusyKey !== '' ||
+                  busyMatrixDownload ||
+                  !viewedScopeUploadable ||
+                  finishedDownloadableExperiments.length === 0
+                }
+              >
+                <Upload size={16} />
               </button>
             </div>
           </div>
