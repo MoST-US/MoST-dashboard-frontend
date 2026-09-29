@@ -237,6 +237,12 @@
   z-index: 3;
 }
 
+/* An additive results source puts the mix list and the full workload profile matrix in the same
+   panel, so that panel needs room for the matrix columns. */
+.dashboard-main.is-additive {
+  grid-template-columns: minmax(760px, 1.6fr) minmax(0, 1fr);
+}
+
 .experiment-panel,
 .chart-panel,
 .detail-panel,
@@ -468,7 +474,28 @@
   font-family: var(--mono-font);
 }
 
-/* Additive results sources list one row per `mix_...` sub-experiment instead of the matrix. */
+/* Additive results sources list one row per `mix_...` sub-experiment beside the workload profile
+   matrix that marks the cells the selected mix uses. The matrix column keeps enough room for every
+   configured output interval (a 760px panel leaves it about 520px, the width the interval matrix
+   gets in a non-additive source), and below 1200px the list moves above it. */
+.additive-layout {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.55fr) minmax(0, 1.45fr);
+  gap: 0.7rem;
+  align-items: start;
+}
+
+.additive-layout .experiment-matrix-wrapper {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+/* The grid is never squeezed below the width its columns need: long interval labels or extra
+   intervals scroll inside the wrapper instead of clipping the alpha values. */
+.additive-matrix {
+  min-width: max-content;
+}
+
 .additive-list {
   display: flex;
   flex-direction: column;
@@ -505,9 +532,20 @@
   line-height: 1.1;
 }
 
-.additive-item-meta {
-  font-size: 0.78rem;
-  line-height: 1.1;
+.experiment-matrix .matrix-cell[data-tone='mix'] {
+  color: #7a1010;
+  font-weight: 700;
+  box-shadow: inset 0 0 0 1px rgba(122, 16, 16, 0.4);
+}
+
+/* The additive matrix is read-only: the selected mix highlights its cells and the list beside it
+   drives the selection, so the cells do not behave like the clickable experiment cells. */
+.additive-matrix .matrix-cell {
+  cursor: default;
+}
+
+.additive-matrix .matrix-cell:hover {
+  transform: none;
 }
 
 .additive-item[data-tone='finished'] {
@@ -796,6 +834,18 @@ td {
   color: var(--ink-700);
   text-align: center;
   padding: 2rem 0.8rem;
+}
+
+/* Below this width the matrix column would be narrower than its cells need, so the mix list moves
+   above the matrix, which then spans the whole panel (and the chart moves below the panel). */
+@media (max-width: 1200px) {
+  .dashboard-main.is-additive {
+    grid-template-columns: 1fr;
+  }
+
+  .additive-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 980px) {
