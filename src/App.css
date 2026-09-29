@@ -571,6 +571,115 @@
   box-shadow: inset 0 0 0 1px rgba(17, 17, 17, 0.12);
 }
 
+/* MIT/MST comparison: the picker sits above the workload profile matrix, the four additive metrics
+   of the selected mix below it, and the same metrics repeat on every list row. The column keeps
+   `min-width: 0` so the matrix wrapper still scrolls inside a narrower panel. */
+.additive-matrix-column {
+  display: grid;
+  gap: 0.55rem;
+  align-content: start;
+  min-width: 0;
+}
+
+.comparison-picker {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.comparison-picker label {
+  color: var(--ink-700);
+  font-size: 0.7rem;
+  font-family: var(--mono-font);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.comparison-picker select {
+  border: 1px solid var(--line-300);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--ink-900);
+  font-family: var(--ui-font);
+  font-size: 0.86rem;
+  padding: 0.42rem 0.55rem;
+}
+
+.comparison-picker select:disabled {
+  color: var(--ink-700);
+  background: #f4f6fa;
+}
+
+.comparison-picker select:focus-visible {
+  outline: 2px solid rgba(31, 95, 255, 0.35);
+  outline-offset: 1px;
+}
+
+.comparison-summary {
+  border: 1px solid var(--line-300);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 0.5rem 0.6rem;
+  display: grid;
+  gap: 0.32rem;
+}
+
+.comparison-summary-title {
+  margin: 0;
+  color: var(--ink-900);
+  font-size: 0.72rem;
+  font-weight: 700;
+  font-family: var(--mono-font);
+  overflow-wrap: anywhere;
+}
+
+.comparison-summary-values {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.16rem 0.6rem;
+}
+
+/* The list rows render the distance alone, so a single column lets it use the whole row. */
+.additive-item-comparison {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.16rem 0.6rem;
+  width: 100%;
+  margin-top: 0.12rem;
+}
+
+.comparison-summary-note {
+  margin: 0;
+  color: var(--ink-700);
+  font-size: 0.68rem;
+  font-family: var(--mono-font);
+  overflow-wrap: anywhere;
+}
+
+/* The metrics inherit the color of their container, so they stay readable on the colored list rows
+   and inside the white comparison block. */
+.comparison-metric {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.4rem;
+  min-width: 0;
+  font-family: var(--mono-font);
+  font-size: 0.68rem;
+  color: inherit;
+}
+
+.additive-item-comparison .comparison-metric {
+  font-size: 0.64rem;
+}
+
+.comparison-metric-label {
+  opacity: 0.75;
+}
+
+.comparison-metric-value {
+  font-weight: 700;
+}
+
 .chart-panel {
   padding: 0.9rem 1rem;
   min-width: 0;

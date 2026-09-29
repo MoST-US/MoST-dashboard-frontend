@@ -433,6 +433,35 @@ function formatAdditiveAlpha(alpha) {
   return text || '0'
 }
 
+// The comparison metrics reuse the matrix cell precision (two decimals); missing inputs render as
+// `n/a`, the same token the matrix uses for a cell whose sigma cannot be derived.
+function formatComparisonValue(value) {
+  if (!Number.isFinite(value)) {
+    return 'n/a'
+  }
+
+  return String(Math.round(value * 100) / 100)
+}
+
+// The distance is a relative error, so it is shown as a signed percentage; the raw ratio stays in
+// the tooltip of the metric.
+function formatDistanceValue(value) {
+  if (!Number.isFinite(value)) {
+    return 'n/a'
+  }
+
+  const percentage = value * 100
+  return `${percentage > 0 ? '+' : ''}${percentage.toFixed(2)}%`
+}
+
+// `Experiment_<TYPE>_<timestamp>` names a MIT/MST archive while `Experiment_MIX_<TYPE>_<timestamp>`
+// names an additive one, so the type is the token right after `Experiment_`: an additive results
+// source therefore reports `MIX` and never matches the MIT/MST sources its mixes are compared with.
+function readExperimentTypeFromScope(scope) {
+  const match = /^Experiment_([A-Za-z0-9]+)(?:_|$)/i.exec(String(scope || '').trim())
+  return match ? match[1].toUpperCase() : ''
+}
+
 // JSON `null` and CSV empty cells count as missing, unlike `Number(null) === 0`, so profiles that
 // only carry a partial interval are ignored instead of producing a bogus `0-...` axis entry.
 function toFiniteNumber(value) {
@@ -518,6 +547,114 @@ function buildAdditiveMatrixModel(additiveExperiments, experimentStatuses, confi
     inputRanges: [...inputRanges].sort(compareByIntervalStart),
     outputRanges: [...outputRanges].sort(compareByIntervalStart),
     cellMap,
+  }
+}
+
+// A comparison experiment folder and a mix profile may spell the same interval differently (`100`,
+// `100-100`, `100.0-100.0`), so both sides are normalized to `start-end` with plain numbers before a
+// profile is matched to the folder that measured it.
+function normalizeIntervalText(interval) {
+  const text = String(interval === null || interval === undefined ? '' : interval).trim()
+  if (!text) {
+    return ''
+  }
+
+  const [startToken, endToken = text] = text.split('-')
+  const start = Number(startToken)
+  const end = Number(endToken)
+  if (!startToken || !endToken || !Number.isFinite(start) || !Number.isFinite(end)) {
+    return text
+  }
+
+  return `${start}-${end}`
+}
+
+// Folder-name lookup of a MIT/MST results source, keyed like the additive matrix cells
+// (`inputRange__outputRange`), so every profile of a mix finds the experiment that measured it.
+function buildComparisonPairMap(experimentNames) {
+  const names = experimentNames || []
+  const pairMap = {}
+
+  names.forEach((experimentName) => {
+    const parsed = parseExperimentPair(experimentName)
+    if (!parsed) {
+      return
+    }
+
+    const pairKey = `${normalizeIntervalText(parsed.inputRange)}__${normalizeIntervalText(parsed.outputRange)}`
+    pairMap[pairKey] = experimentName
+  })
+
+  return pairMap
+}
+
+// Reference value of a MIT/MST results source: the largest MIT/MST value (`LARGEST_TRUE`) found in
+// its cells, finished or not. It plays the role of the fastest profile, which carries 1.0 CU.
+function resolveComparisonSigma(experimentStatuses) {
+  const values = Object.values(experimentStatuses || {})
+    .map((status) => toFiniteNumber(status?.largestTrue))
+    .filter((value) => Number.isFinite(value) && value > 0)
+
+  return values.length > 0 ? Math.max(...values) : null
+}
+
+// Compares one additive mix with a MIT/MST results source using the additivity model:
+//   sigma(p) = Sigma / MST(p)          MST(p) is the MIT/MST value of the cell of profile p
+//   expected_sigma = sum(alpha(p) * sigma(p))
+//   expected_throughput = Sigma / expected_sigma
+//   true_sigma = Sigma / true_throughput
+//   distance = (true_throughput - expected_throughput) / expected_throughput
+// A mix whose profiles are not all present in the comparison source publishes no expected values
+// (`complete: false`) instead of a partial sum.
+function buildMixComparison({ profiles, trueValue, pairMap, comparisonStatuses, scopeSigma }) {
+  const profileList = profiles || []
+  const missingProfiles = []
+  const hasSigma = Number.isFinite(scopeSigma) && scopeSigma > 0
+  let expectedSigma = 0
+  let usableProfiles = 0
+
+  profileList.forEach((profile) => {
+    const intervals = additiveProfileIntervals(profile)
+    const alpha = toFiniteNumber(profile?.alpha)
+    if (!intervals || !(alpha > 0)) {
+      return
+    }
+
+    const pairKey = `${normalizeIntervalText(intervals.inputRange)}__${normalizeIntervalText(intervals.outputRange)}`
+    const experiment = pairMap ? pairMap[pairKey] : null
+    const value = toFiniteNumber(
+      comparisonStatuses ? comparisonStatuses[experiment]?.largestTrue : null,
+    )
+
+    if (!hasSigma || !Number.isFinite(value) || value <= 0) {
+      missingProfiles.push(profile?.label || `${intervals.inputRange}:${intervals.outputRange}`)
+      return
+    }
+
+    expectedSigma += alpha * (scopeSigma / value)
+    usableProfiles += 1
+  })
+
+  const trueThroughput = toFiniteNumber(trueValue)
+  const hasTrueThroughput = Number.isFinite(trueThroughput) && trueThroughput > 0
+  const complete = usableProfiles > 0 && missingProfiles.length === 0
+  const expectedThroughput = complete && expectedSigma > 0 ? scopeSigma / expectedSigma : null
+  const trueSigma = hasSigma && hasTrueThroughput ? scopeSigma / trueThroughput : null
+  const distance =
+    Number.isFinite(expectedThroughput) && expectedThroughput !== 0 && hasTrueThroughput
+      ? (trueThroughput - expectedThroughput) / expectedThroughput
+      : null
+
+  return {
+    hasSigma,
+    scopeSigma: hasSigma ? scopeSigma : null,
+    complete,
+    expectedSigma: complete && expectedSigma > 0 ? expectedSigma : null,
+    expectedThroughput: Number.isFinite(expectedThroughput) ? expectedThroughput : null,
+    trueThroughput: hasTrueThroughput ? trueThroughput : null,
+    trueSigma,
+    distance,
+    missingProfiles,
   }
 }
 
@@ -825,6 +962,36 @@ function IterationSummary({ point }) {
   )
 }
 
+// The four comparison metrics of one mix, shared by the list rows and the block under the matrix.
+// The list rows show the distance alone, while the block under the matrix keeps all of them so the
+// expected and true values that explain that distance stay readable next to the selected mix.
+const COMPARISON_METRIC_LABELS = ['expected_sigma', 'expected_throughput', 'true_sigma', 'distance']
+const ADDITIVE_ITEM_METRIC_LABELS = ['distance']
+
+function ComparisonMetrics({ comparison, only = COMPARISON_METRIC_LABELS }) {
+  const metrics = [
+    { label: 'expected_sigma', value: formatComparisonValue(comparison?.expectedSigma) },
+    { label: 'expected_throughput', value: formatComparisonValue(comparison?.expectedThroughput) },
+    { label: 'true_sigma', value: formatComparisonValue(comparison?.trueSigma) },
+    {
+      label: 'distance',
+      value: formatDistanceValue(comparison?.distance),
+      title: Number.isFinite(comparison?.distance) ? String(comparison.distance) : undefined,
+    },
+  ].filter((metric) => only.includes(metric.label))
+
+  return (
+    <>
+      {metrics.map((metric) => (
+        <span className="comparison-metric" key={metric.label} title={metric.title}>
+          <span className="comparison-metric-label">{metric.label}</span>
+          <span className="comparison-metric-value">{metric.value}</span>
+        </span>
+      ))}
+    </>
+  )
+}
+
 function App() {
   const chartWrapperRef = useRef(null)
   const [activeApiPort, setActiveApiPort] = useState(CONFIGURED_API_PORTS[0])
@@ -844,6 +1011,12 @@ function App() {
   const [busyMatrixDownload, setBusyMatrixDownload] = useState(false)
   const [experimentStatuses, setExperimentStatuses] = useState({})
   const [loadingMatrixStatus, setLoadingMatrixStatus] = useState(false)
+  // MIT/MST results source the additive panel compares its mixes against. It is used only by the
+  // comparison metrics: the matrix, chart and detail panels keep reading `selectedResultsScope`.
+  const [comparisonScope, setComparisonScope] = useState('')
+  const [comparisonExperiments, setComparisonExperiments] = useState([])
+  const [comparisonStatuses, setComparisonStatuses] = useState({})
+  const [loadingComparison, setLoadingComparison] = useState(false)
   const [tunnelState, setTunnelState] = useState({
     loading: true,
     reachable: false,
@@ -1035,6 +1208,59 @@ function App() {
       isCancelled = true
     }
   }, [experiments, activeApiPort, selectedResultsScope])
+
+  // The comparison metrics of the additive panel read a second, MIT/MST results source without
+  // touching the main *Results source*: its `mix_...` folders are filtered out (they are additive
+  // sub-experiments) and every remaining interval pair reports the cell value it measured.
+  useEffect(() => {
+    if (!comparisonScope) {
+      setComparisonExperiments([])
+      setComparisonStatuses({})
+      setLoadingComparison(false)
+      return
+    }
+
+    let isCancelled = false
+
+    async function loadComparisonStatuses() {
+      setLoadingComparison(true)
+
+      try {
+        const data = await fetchJson('/api/experiments', activeApiPort, {
+          resultsScope: comparisonScope,
+        })
+        const names = (data.experiments || []).filter(
+          (experiment) => !isAdditiveExperimentName(experiment),
+        )
+        const statuses = await Promise.all(
+          names.map(async (experiment) => [
+            experiment,
+            await fetchExperimentStatus(experiment, activeApiPort, comparisonScope),
+          ]),
+        )
+
+        if (!isCancelled) {
+          setComparisonExperiments(names)
+          setComparisonStatuses(Object.fromEntries(statuses))
+        }
+      } catch {
+        if (!isCancelled) {
+          setComparisonExperiments([])
+          setComparisonStatuses({})
+        }
+      } finally {
+        if (!isCancelled) {
+          setLoadingComparison(false)
+        }
+      }
+    }
+
+    loadComparisonStatuses()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [comparisonScope, activeApiPort])
 
   useEffect(() => {
     if (!selectedExperiment) {
@@ -1240,6 +1466,63 @@ function App() {
 
     return Math.max(...finishedLargestTrueValues)
   }, [finishedLargestTrueValues])
+
+  // The comparison metrics come from a source of the same experiment type as the additivity run: an
+  // MIT additive source compares against `Experiment_MIT_*`, an MST one against `Experiment_MST_*`.
+  const additiveExperimentType = useMemo(() => {
+    if (matrixExperimentType) {
+      return matrixExperimentType.toUpperCase()
+    }
+
+    return readExperimentTypeFromScope(selectedResultsScope) || DEFAULT_EXPERIMENT_TYPE
+  }, [matrixExperimentType, selectedResultsScope])
+
+  const comparisonScopeOptions = useMemo(
+    () =>
+      resultsScopeOptions.filter(
+        (scope) => readExperimentTypeFromScope(scope) === additiveExperimentType,
+      ),
+    [resultsScopeOptions, additiveExperimentType],
+  )
+
+  // A source left selected after the main results source changes type (or disappears) is cleared,
+  // so the panel never shows metrics computed against a foreign experiment type.
+  useEffect(() => {
+    if (comparisonScope && !comparisonScopeOptions.includes(comparisonScope)) {
+      setComparisonScope('')
+    }
+  }, [comparisonScope, comparisonScopeOptions])
+
+  // Every mix is compared in one pass so the list rows (one mix each) and the block under the matrix
+  // (the selected mix) read from the same numbers.
+  const comparisonByMix = useMemo(() => {
+    if (!comparisonScope) {
+      return {}
+    }
+
+    const pairMap = buildComparisonPairMap(comparisonExperiments)
+    const comparisonSigma = resolveComparisonSigma(comparisonStatuses)
+    const entries = additiveExperiments.map((entry) => [
+      entry.name,
+      buildMixComparison({
+        profiles: resolveAdditiveProfiles(entry, experimentStatuses?.[entry.name]),
+        trueValue: experimentStatuses?.[entry.name]?.largestTrue,
+        pairMap,
+        comparisonStatuses,
+        scopeSigma: comparisonSigma,
+      }),
+    ])
+
+    return Object.fromEntries(entries)
+  }, [
+    comparisonScope,
+    comparisonExperiments,
+    comparisonStatuses,
+    additiveExperiments,
+    experimentStatuses,
+  ])
+
+  const selectedComparison = comparisonByMix[selectedExperiment] || null
 
   const heatScale = useMemo(() => {
     if (finishedLargestTrueValues.length === 0) {
@@ -1878,69 +2161,131 @@ function App() {
                           {itemExperimentType ? `${itemExperimentType}: ` : ''}
                           {absoluteText}
                         </span>
+                        {comparisonScope && (
+                          <span className="additive-item-comparison">
+                            <ComparisonMetrics
+                              comparison={comparisonByMix[entry.name]}
+                              only={ADDITIVE_ITEM_METRIC_LABELS}
+                            />
+                          </span>
+                        )}
                       </button>
                     )
                   })}
                 </div>
-                <div className="experiment-matrix-wrapper">
-                  {displayedAdditiveInputRanges.length === 0 || additiveMatrixModel.outputRanges.length === 0 ? (
-                    <p className="placeholder">
-                      No workload profile intervals found for this results source.
-                    </p>
-                  ) : (
-                    <div
-                      className="experiment-matrix additive-matrix"
-                      style={{
-                        gridTemplateColumns: `minmax(68px, 1.2fr) repeat(${additiveMatrixModel.outputRanges.length}, minmax(0, 1fr))`,
-                      }}
+                <div className="additive-matrix-column">
+                  <div className="comparison-picker">
+                    <label htmlFor="comparison-scope-select">MIT/MST results to compare</label>
+                    <select
+                      id="comparison-scope-select"
+                      value={comparisonScope}
+                      onChange={(event) => setComparisonScope(event.target.value)}
+                      disabled={comparisonScopeOptions.length === 0}
                     >
-                      {displayedAdditiveInputRanges.map((inputRange) => (
-                        <Fragment key={`additive-matrix-row-${inputRange}`}>
-                          <div className="matrix-header matrix-row-header">
-                            {formatIntervalLabel(inputRange)}
-                          </div>
-                          {additiveMatrixModel.outputRanges.map((outputRange) => {
-                            const pairKey = `${inputRange}__${outputRange}`
-                            const alpha = selectedAdditiveCellAlphaByKey[pairKey]
-                            const isUsed = Number.isFinite(alpha)
+                      {comparisonScopeOptions.length === 0 && (
+                        <option value="">{`No ${additiveExperimentType} results source`}</option>
+                      )}
+                      <option value="">None</option>
+                      {comparisonScopeOptions.map((scope) => (
+                        <option key={`comparison-scope-${scope}`} value={scope}>
+                          {formatResultsScopeLabel(scope)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="experiment-matrix-wrapper">
+                    {displayedAdditiveInputRanges.length === 0 || additiveMatrixModel.outputRanges.length === 0 ? (
+                      <p className="placeholder">
+                        No workload profile intervals found for this results source.
+                      </p>
+                    ) : (
+                      <div
+                        className="experiment-matrix additive-matrix"
+                        style={{
+                          gridTemplateColumns: `minmax(68px, 1.2fr) repeat(${additiveMatrixModel.outputRanges.length}, minmax(0, 1fr))`,
+                        }}
+                      >
+                        {displayedAdditiveInputRanges.map((inputRange) => (
+                          <Fragment key={`additive-matrix-row-${inputRange}`}>
+                            <div className="matrix-header matrix-row-header">
+                              {formatIntervalLabel(inputRange)}
+                            </div>
+                            {additiveMatrixModel.outputRanges.map((outputRange) => {
+                              const pairKey = `${inputRange}__${outputRange}`
+                              const alpha = selectedAdditiveCellAlphaByKey[pairKey]
+                              const isUsed = Number.isFinite(alpha)
 
-                            return (
-                              <div
-                                key={`additive-${inputRange}-${outputRange}`}
-                                className="matrix-cell"
-                                data-tone={isUsed ? 'mix' : 'empty'}
-                                style={isUsed ? { backgroundColor: ADDITIVE_MIX_CELL_COLOR } : undefined}
-                                title={
-                                  isUsed
-                                    ? `${selectedExperimentLabel} · alpha=${formatAdditiveAlpha(alpha)}`
-                                    : 'Not used by the selected mix'
-                                }
-                              >
-                                <span className="matrix-cell-values">
-                                  <span className="matrix-cell-subvalue">
-                                    {isUsed ? formatAdditiveAlpha(alpha) : ''}
+                              return (
+                                <div
+                                  key={`additive-${inputRange}-${outputRange}`}
+                                  className="matrix-cell"
+                                  data-tone={isUsed ? 'mix' : 'empty'}
+                                  style={isUsed ? { backgroundColor: ADDITIVE_MIX_CELL_COLOR } : undefined}
+                                  title={
+                                    isUsed
+                                      ? `${selectedExperimentLabel} · alpha=${formatAdditiveAlpha(alpha)}`
+                                      : 'Not used by the selected mix'
+                                  }
+                                >
+                                  <span className="matrix-cell-values">
+                                    <span className="matrix-cell-subvalue">
+                                      {isUsed ? formatAdditiveAlpha(alpha) : ''}
+                                    </span>
                                   </span>
-                                </span>
-                              </div>
-                            )
-                          })}
-                        </Fragment>
-                      ))}
+                                </div>
+                              )
+                            })}
+                          </Fragment>
+                        ))}
 
-                      <div className="matrix-corner matrix-footer-corner">
-                        <span className="matrix-corner-label matrix-corner-label-input">Input</span>
-                        <span className="matrix-corner-label matrix-corner-label-output">Output</span>
-                      </div>
-                      {additiveMatrixModel.outputRanges.map((outputRange) => (
-                        <div
-                          className="matrix-header matrix-col-footer"
-                          key={`additive-footer-${outputRange}`}
-                        >
-                          {formatIntervalLabel(outputRange)}
+                        <div className="matrix-corner matrix-footer-corner">
+                          <span className="matrix-corner-label matrix-corner-label-input">Input</span>
+                          <span className="matrix-corner-label matrix-corner-label-output">Output</span>
                         </div>
-                      ))}
-                    </div>
-                  )}
+                        {additiveMatrixModel.outputRanges.map((outputRange) => (
+                          <div
+                            className="matrix-header matrix-col-footer"
+                            key={`additive-footer-${outputRange}`}
+                          >
+                            {formatIntervalLabel(outputRange)}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="comparison-summary">
+                    <p className="comparison-summary-title">
+                      {comparisonScope
+                        ? `Comparison · ${selectedExperimentLabel} vs ${formatResultsScopeLabel(comparisonScope)}`
+                        : 'Comparison'}
+                    </p>
+                    {comparisonScope ? (
+                      <>
+                        <div className="comparison-summary-values">
+                          <ComparisonMetrics comparison={selectedComparison} />
+                        </div>
+                        <p className="comparison-summary-note">
+                          {`Sigma = ${formatComparisonValue(selectedComparison?.scopeSigma)} (largest MIT/MST value of the source)`}
+                          {` · true throughput = ${formatComparisonValue(selectedComparison?.trueThroughput)}`}
+                        </p>
+                        {selectedComparison?.missingProfiles?.length > 0 && (
+                          <p className="comparison-summary-note">
+                            {'Profiles without a MIT/MST measurement (every profile is needed for the expected values): '}
+                            {selectedComparison.missingProfiles.join(', ')}
+                          </p>
+                        )}
+                        {loadingComparison && (
+                          <p className="comparison-summary-note">Loading comparison results...</p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="comparison-summary-note">
+                        {comparisonScopeOptions.length > 0
+                          ? `Select an ${additiveExperimentType} results source above to compare the expected and true values of every mix.`
+                          : `No Experiment_${additiveExperimentType}_* results source found for this additive run.`}
+                      </p>
+                    )}
+                  </div>
                 </div>
               </div>
             )
