@@ -497,6 +497,22 @@ function describeUploadExperiments(experimentFolders) {
   return ` (${folders.length} experiment folders)`
 }
 
+// Uploads whose names git cannot check out are committed under a shortened name (see `planUploadTree` in
+// github-results-uploader.mjs), so the server log is where the full name is still visible and a folder
+// found in the repository can be traced back to the experiment/sub-experiment it came from.
+function logShortenedUploadNames(result) {
+  const trimmed = result?.trimmed
+  if (!trimmed || !Number.isInteger(trimmed.count) || trimmed.count < 1) {
+    return
+  }
+
+  console.log(
+    `[github] shortened ${trimmed.count} folder name(s) too long for git; committed as ${
+      (trimmed.examples || []).map((entry) => `${entry.to} (was ${entry.from})`).join(', ')
+    }`,
+  )
+}
+
 // Commits the results the dashboard collected (the same `results.csv` folder tree the ZIP download
 // builds) into the results repository. The upload itself runs here so the GitHub token never leaves
 // the server-side .env, and one request produces exactly one commit. Every posted file names the
@@ -552,6 +568,8 @@ async function handleGitHubUpload(req, res) {
       files: payload.files,
       commitMessage: typeof payload.commitMessage === 'string' ? payload.commitMessage : '',
     })
+
+    logShortenedUploadNames(result)
 
     jsonResponse(res, 200, {
       ...result,

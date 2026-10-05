@@ -211,6 +211,10 @@ function extractModelName(llmResponse) {
 
 const MODEL_USED_KEYS = ['MODEL_USED', 'Model used', 'model_used', 'MODEL', 'model']
 const MODEL_URL_KEYS = ['URL', 'url', 'Url', 'endpoint', 'model_url']
+const GPU_COUNT_KEYS = ['GPU_COUNT', 'GPU count', 'gpu_count', 'GPUS', 'gpus', 'num_gpus']
+// Only the columns an upload folder is built from. `?fields=` keeps the fallback payload tiny, and a
+// legacy results.csv without one of them simply answers with rows that do not carry that key.
+const UPLOAD_IDENTITY_FIELDS = 'MODEL_USED,URL,GPU_COUNT'
 
 function parseEndpointFromUrl(rawUrl) {
   const cleaned = String(rawUrl || '')
@@ -971,6 +975,76 @@ async function fetchGpuCountForPort(port, resultsScope, modelUrl, fallbackModelI
   return null
 }
 
+// The attributes the results themselves record: a finished run stores the model it served, the host it
+// was served on and the GPU count it used in its own results.csv (MODEL_USED, URL, GPU_COUNT). They
+// name the same upload folder the live API answers with, so they are the fallback for results whose
+// serving job no longer responds (`/api/llm-name` reports "unknown" once the model process is gone and
+// squeue can no longer see the job). Read lazily, only for values the live resolution is missing, and
+// they never override one. The caller passes the results sources to try, most specific first, and the
+// first usable value of every field wins.
+async function readResultsUploadIdentity(port, resultsScopes) {
+  const identity = { model: '', node: '', port: null, gpuCount: null, resultsScope: '' }
+  const scopes = [...new Set((resultsScopes || []).filter(Boolean))]
+
+  for (const resultsScope of scopes) {
+    try {
+      const current = await fetchJson('/api/current-experiment', port, { resultsScope })
+      const experiment = current?.experiment
+      const iteration = current?.iteration
+      if (!experiment || !iteration) {
+        continue
+      }
+
+      const csv = await fetchJson(
+        `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iteration)}/results.csv`,
+        port,
+        { resultsScope, fields: UPLOAD_IDENTITY_FIELDS },
+      )
+
+      // The newest row is the state the run ended in, so it is read first. Every iteration of an
+      // archive repeats the same columns, which is why the fields are collected row by row.
+      const rows = [...(csv?.rows || [])].reverse()
+      for (const row of rows) {
+        if (!identity.model) {
+          const model = getFieldValue(row, MODEL_USED_KEYS)
+          if (isUsableUploadValue(model)) {
+            identity.model = String(model).trim()
+          }
+        }
+
+        if (!identity.node) {
+          const endpoint = parseEndpointFromUrl(getFieldValue(row, MODEL_URL_KEYS))
+          if (endpoint) {
+            identity.node = endpoint.node
+            identity.port = endpoint.port
+          }
+        }
+
+        if (identity.gpuCount === null) {
+          identity.gpuCount = parseUploadGpuCount(getFieldValue(row, GPU_COUNT_KEYS))
+        }
+
+        if (identity.model && identity.node && identity.gpuCount !== null) {
+          break
+        }
+      }
+
+      if (identity.model || identity.node || identity.gpuCount !== null) {
+        identity.resultsScope = identity.resultsScope || resultsScope
+      }
+
+      if (identity.model && identity.node && identity.gpuCount !== null) {
+        return identity
+      }
+    } catch {
+      // A scope whose latest iteration has no readable results.csv contributes nothing; the next
+      // scope is tried and an empty identity keeps the caller on its previous behavior.
+    }
+  }
+
+  return identity
+}
+
 // Values the API-related helpers report when they could not resolve something. They must never end up
 // in an upload folder name or in a GitHub commit message.
 const UPLOAD_UNAVAILABLE_VALUES = new Set([
@@ -992,6 +1066,13 @@ function isUsableUploadValue(value) {
   }
 
   return !UPLOAD_UNAVAILABLE_VALUES.has(String(value).trim().toLowerCase())
+}
+
+// `GPU_COUNT` is stored best-effort by the experiment environment and may be blank, so only a plain
+// integer inside the range the uploader accepts may reach the folder name (`<model>-<gpuType>-<N>gpus`).
+function parseUploadGpuCount(value) {
+  const numeric = Number(String(value ?? '').trim())
+  return Number.isInteger(numeric) && numeric >= 1 && numeric <= MAX_UPLOAD_GPU_COUNT ? numeric : null
 }
 
 // Uploads are restricted to finished experiments: only those have a complete results.csv series.
@@ -2071,12 +2152,17 @@ function App() {
     }
   }
 
-  // The GPU count names the upload folder (`<model>-<gpuType>-<N>gpus`). `/api/job-gpu-count` cannot
-  // answer for results whose job is long gone and whose results.csv has no GPU column, so the
-  // operator is asked once per port and the answer is reused for the rest of the session.
-  async function resolveUploadGpuCount(port, model, node, identity) {
+  // The GPU count names the upload folder (`<model>-<gpuType>-<N>gpus`). `/api/job-gpu-count` answers
+  // from squeue while the serving job runs and then from the results the scope holds, and the uploaded
+  // results themselves carry the count in their GPU_COUNT column. Only when every source is silent is
+  // the operator asked, once per port and session.
+  async function resolveUploadGpuCount(port, model, node, identity, resultsGpuCount) {
     if (Number.isInteger(identity?.gpuCount) && identity.gpuCount > 0) {
       return identity.gpuCount
+    }
+
+    if (Number.isInteger(resultsGpuCount) && resultsGpuCount > 0) {
+      return resultsGpuCount
     }
 
     const remembered = uploadGpuCountOverridesRef.current[port]
@@ -2112,39 +2198,68 @@ function App() {
   }
 
   // Everything the tunnel manager needs to name the commit folder: the model of the serving job, the
-  // cluster node (which resolves the GPU type through GPU_TYPE_MAP) and the GPU count.
-  async function resolveUploadTarget(port, identity) {
+  // cluster node (which resolves the GPU type through GPU_TYPE_MAP) and the GPU count. The live API and
+  // the MoST `.env` model URL answer first; the attributes the uploaded results record about themselves
+  // (MODEL_USED, URL, GPU_COUNT in results.csv) fill in whatever those cannot answer, which is what
+  // makes an upload of an archive whose serving job already ended possible without guessing.
+  async function resolveUploadTarget(port, identity, entries) {
     const endpoint = await resolveModelEndpointForPort(
       port,
       selectedResultsScope,
       identity?.modelUrl,
     )
 
-    if (!endpoint?.node) {
-      return {
-        ok: false,
-        error: `Unable to determine the GPU host of port ${port}, so the GPU type of the upload folder cannot be mapped.`,
-      }
-    }
-
     let model = isUsableUploadValue(identity?.llm) ? String(identity.llm).trim() : ''
-    if (!model && isUsableUploadValue(endpoint.model)) {
+    if (!model && isUsableUploadValue(endpoint?.model)) {
       model = String(endpoint.model).trim()
     }
 
-    if (!model) {
-      return { ok: false, error: `Unable to determine the model name of port ${port}.` }
+    let gpuCount =
+      Number.isInteger(identity?.gpuCount) && identity.gpuCount > 0 ? identity.gpuCount : null
+    let resultsIdentity = null
+
+    // Read lazily: an upload of a run whose serving job still answers costs no extra request. The
+    // scopes of the experiments being uploaded are tried first, then the source selected in the panel.
+    if (!endpoint?.node || !model || gpuCount === null) {
+      resultsIdentity = await readResultsUploadIdentity(port, [
+        ...(entries || []).map((entry) => entry?.resultsScope),
+        selectedResultsScope,
+      ])
+
+      if (!model && isUsableUploadValue(resultsIdentity.model)) {
+        model = String(resultsIdentity.model).trim()
+      }
+
+      if (gpuCount === null) {
+        gpuCount = resultsIdentity.gpuCount
+      }
     }
 
-    const gpuCount = await resolveUploadGpuCount(port, model, endpoint.node, identity)
-    if (!Number.isInteger(gpuCount)) {
+    const node = endpoint?.node || resultsIdentity?.node || ''
+
+    if (!node) {
+      return {
+        ok: false,
+        error: `Unable to determine the GPU host of port ${port}: neither the MoST .env model URL nor the URL column of the results.csv of its results sources names one, so the GPU type of the upload folder cannot be mapped.`,
+      }
+    }
+
+    if (!model) {
+      return {
+        ok: false,
+        error: `Unable to determine the model name of port ${port}: neither the serving API nor the MODEL_USED column of the results.csv of its results sources reports one.`,
+      }
+    }
+
+    const resolvedGpuCount = await resolveUploadGpuCount(port, model, node, identity, gpuCount)
+    if (!Number.isInteger(resolvedGpuCount)) {
       return {
         ok: false,
         error: `Upload cancelled: an integer GPU count between 1 and ${MAX_UPLOAD_GPU_COUNT} is required to name the folder of ${model}.`,
       }
     }
 
-    return { ok: true, model, node: endpoint.node, gpuCount }
+    return { ok: true, model, node, gpuCount: resolvedGpuCount }
   }
 
   // Shared by the three upload entry points: collect the folder-style results of the given experiments
@@ -2184,7 +2299,7 @@ function App() {
     setErrorMessage('')
 
     try {
-      const target = await resolveUploadTarget(port, identity)
+      const target = await resolveUploadTarget(port, identity, entries)
       if (!target.ok) {
         setErrorMessage(target.error)
         return
@@ -2241,11 +2356,18 @@ function App() {
       }
       const skippedLabel =
         skippedCount > 0 ? ` ${skippedCount} unfinished experiment(s) were skipped.` : ''
+      // Folder names git cannot check out are shortened by the server (the paths above are the ones the
+      // repository actually has), so the notice says how many: the tunnel manager log maps them back.
+      const trimmedCount = Number(result.trimmed?.count) || 0
+      const trimmedLabel =
+        trimmedCount > 0
+          ? ` ${trimmedCount} folder name(s) were shortened to fit git path limits.`
+          : ''
 
       setUploadNotice({
         text: result.unchanged
-          ? `GitHub already had this content in ${targetLabel}; no new commit was created.${skippedLabel}`
-          : `Uploaded ${result.fileCount} file(s) from ${experimentCount} experiment(s)${sourceLabelSuffix} to ${result.repo} (${targetLabel} on ${result.branch}).${skippedLabel}`,
+          ? `GitHub already had this content in ${targetLabel}; no new commit was created.${skippedLabel}${trimmedLabel}`
+          : `Uploaded ${result.fileCount} file(s) from ${experimentCount} experiment(s)${sourceLabelSuffix} to ${result.repo} (${targetLabel} on ${result.branch}).${skippedLabel}${trimmedLabel}`,
         commitUrl: result.commitUrl || '',
         commitLabel: result.commitSha ? result.commitSha.slice(0, 7) : '',
         unchanged: Boolean(result.unchanged),
