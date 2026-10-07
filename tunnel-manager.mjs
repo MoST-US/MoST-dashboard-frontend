@@ -513,11 +513,12 @@ function logShortenedUploadNames(result) {
   )
 }
 
-// Commits the results the dashboard collected (the same `results.csv` folder tree the ZIP download
-// builds) into the results repository. The upload itself runs here so the GitHub token never leaves
-// the server-side .env, and one request produces exactly one commit. Every posted file names the
+// Commits the result CSVs the dashboard collected (the same folder tree the ZIP download builds) into
+// the results repository. The upload itself runs here so the GitHub token never leaves the server-side
+// .env. Every posted file names the
 // experiment (results source) it was read from, which becomes the folder level between the GPU folder
 // and the sub-experiment folder: `results/<model>-<gpuType>-<N>gpus/<experiment>/<sub-experiment>/<iteration>/`.
+// Large payloads are split into sequential commits when they exceed the per-commit limits.
 async function handleGitHubUpload(req, res) {
   if (!isGitHubConfigured(githubConfig)) {
     jsonResponse(res, 409, {
@@ -536,6 +537,7 @@ async function handleGitHubUpload(req, res) {
   const model = typeof payload.model === 'string' ? payload.model.trim() : ''
   const node = typeof payload.node === 'string' ? payload.node.trim() : ''
   const gpuCount = Number(payload.gpuCount)
+  const uploadMode = payload.uploadMode === 'update' ? 'update' : 'full'
 
   if (!model) {
     jsonResponse(res, 400, { error: 'A model name is required to build the upload folder.' })
@@ -567,6 +569,7 @@ async function handleGitHubUpload(req, res) {
       folder: folderName.folder,
       files: payload.files,
       commitMessage: typeof payload.commitMessage === 'string' ? payload.commitMessage : '',
+      uploadMode,
     })
 
     logShortenedUploadNames(result)
@@ -578,7 +581,9 @@ async function handleGitHubUpload(req, res) {
       gpuCount,
       message: result.unchanged
         ? `No new results to commit for ${folderName.folder}: the repository already has this content.`
-        : `Uploaded ${result.fileCount} file(s) to ${result.folderPath}${describeUploadExperiments(result.experimentFolders)}.`,
+        : `Uploaded ${result.fileCount} file(s) to ${result.folderPath}${describeUploadExperiments(result.experimentFolders)}${
+            result.batchCount > 1 ? ` in ${result.batchCount} commits` : ''
+          }.`,
     })
   } catch (error) {
     const statusCode =

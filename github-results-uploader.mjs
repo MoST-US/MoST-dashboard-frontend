@@ -1,18 +1,18 @@
 // GitHub upload helper used by tunnel-manager.mjs.
 //
-// The dashboard browser already knows which `results.csv` files exist for a finished experiment (it
+// The dashboard browser already knows which result CSV files exist for a finished experiment (it
 // walks the same folder tree for the ZIP download) and posts them here, so this module only has to
 // turn a flat list of files into one GitHub commit. The GitHub token stays in this Node process on
 // purpose: every `VITE_*` value is inlined into the static bundle, so a token placed there would be
 // readable by anyone who loads the deployed dashboard.
 //
-// The posted files carry base64 because they travel inside a JSON body, while the commit is created
-// with the "create tree" endpoint, whose blob content is plain text: `validateUploadFiles` decodes the
-// payload before it is inlined, so what lands in the repository is the `results.csv` itself and not
-// its base64 spelling.
+// The posted files carry base64 because they travel inside a JSON body. Small files are decoded before
+// being inlined in the "create tree" request, whose blob content is plain text; larger files are sent
+// to the Git blobs endpoint and referenced by SHA, so what lands in the repository is always the CSV
+// itself and not its base64 spelling.
 //
 // Repository layout produced by an upload (see `buildResultsFolderName` / `buildResultsTreePath`):
-//   <GITHUB_RESULTS_PATH>/<model>-<gpuType>-<N>gpus/<experimentFolder>/<sub-experiment>/<iteration>/results.csv
+//   <GITHUB_RESULTS_PATH>/<model>-<gpuType>-<N>gpus/<experimentFolder>/<sub-experiment>/<iteration>/<file>
 // with `<GITHUB_RESULTS_PATH>` defaulting to `results`.
 //
 // The `<experimentFolder>` level names the experiment the results belong to: the results source they
@@ -35,7 +35,8 @@ const DEFAULT_GITHUB_API_BASE_URL = 'https://api.github.com'
 const GITHUB_WEB_BASE_URL = 'https://github.com'
 const DEFAULT_GITHUB_BRANCH = 'main'
 const DEFAULT_GITHUB_RESULTS_PATH = 'results'
-const RESULTS_FILE_NAME = 'results.csv'
+const RESULTS_FILE_NAMES = new Set(['results.csv', 'results_from_json.csv'])
+const UPLOAD_MODES = new Set(['full', 'update'])
 // Results source of a run that is still executing: it has no archive name yet, so it cannot name the
 // experiment level of the upload tree and is never committed on its own.
 const UNNAMED_EXPERIMENT_SOURCE = 'current'
@@ -77,11 +78,19 @@ export const DEFAULT_GPU_TYPE_MAP = Object.freeze({
   A100: ['gpu07', 'gpu08'],
 })
 
-export const MAX_UPLOAD_FILE_BYTES = 8 * 1024 * 1024
+// GitHub rejects blobs at or above 100 MiB. Files up to 8 MiB are inlined in the tree request; larger
+// files use the Git blobs endpoint and are referenced by SHA in the tree instead.
+export const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
+export const MAX_INLINE_UPLOAD_FILE_BYTES = 8 * 1024 * 1024
+// GitHub limits each tree request, not the logical upload. Inline tree entries contain the CSV text
+// inside a JSON document, so their serialized size can be larger than the files' UTF-8 byte count.
+// Keep a conservative limit to avoid GitHub's undocumented request-size ceiling.
 export const MAX_UPLOAD_TOTAL_BYTES = 64 * 1024 * 1024
+export const MAX_UPLOAD_TREE_PAYLOAD_BYTES = 8 * 1024 * 1024
 export const MAX_UPLOAD_FILES = 5000
-// Bodies carry base64 payloads, so the JSON envelope is a third larger than the raw results.
-export const MAX_UPLOAD_BODY_BYTES = MAX_UPLOAD_TOTAL_BYTES + 8 * 1024 * 1024
+// Bodies carry base64 payloads, so the JSON envelope is larger than the raw results. This is the
+// request limit for a logical upload; individual GitHub commits stay within the limits above.
+export const MAX_UPLOAD_BODY_BYTES = 256 * 1024 * 1024
 
 export class GitHubUploadError extends Error {
   constructor(message, statusCode = 502) {
@@ -301,9 +310,9 @@ export function buildResultsFolderName({ model, gpuType, gpuCount } = {}) {
   return { ok: true, folder: `${trimmedModel}-${trimmedType}-${numericCount}gpus`, error: '' }
 }
 
-// `results/<folder>/<experimentFolder>/<sub-experiment>/<iteration>/results.csv` inside the repository.
+// `results/<folder>/<experimentFolder>/<sub-experiment>/<iteration>/<file>` inside the repository.
 // `experimentFolder` is the experiment (results source) the file was read from, and `relativePath` is
-// the `<sub-experiment>/<iteration>/results.csv` tail below it.
+// the `<sub-experiment>/<iteration>/<file>` tail below it.
 export function buildResultsTreePath(config, folder, experimentFolder = '', relativePath = '') {
   return [config?.resultsPath, folder, experimentFolder, relativePath]
     .map((segment) =>
@@ -322,7 +331,10 @@ export function buildResultsTreePath(config, folder, experimentFolder = '', rela
 // never on the actual sub-experiment names, which is what keeps the mapping stable.
 function resolveTreeCaps(resultsPath, folder) {
   const fixedLength =
-    String(resultsPath ?? '').length + String(folder ?? '').length + RESULTS_FILE_NAME.length + 5
+    String(resultsPath ?? '').length +
+    String(folder ?? '').length +
+    Math.max(...[...RESULTS_FILE_NAMES].map((name) => name.length)) +
+    5
   const levels = [
     { key: 'iteration', cap: MAX_ITERATION_SEGMENT_LENGTH, floor: MIN_SEGMENT_LENGTHS.iteration },
     { key: 'subExperiment', cap: MAX_SUB_EXPERIMENT_SEGMENT_LENGTH, floor: MIN_SEGMENT_LENGTHS.subExperiment },
@@ -422,7 +434,23 @@ export function planUploadTree(config, folder, files = []) {
       path: relativePath,
       treePath,
       content: file.content,
+      contentBase64: file.contentBase64,
       bytes: file.bytes,
+      // A CSV just below the inline threshold can still expand substantially when JSON-escaped
+      // (for example, a response-heavy CSV with many quoted fields). Move that entry to the blob
+      // endpoint if its actual tree representation would consume the whole request budget.
+      useBlob:
+        file.useBlob ||
+        Buffer.byteLength(
+          JSON.stringify({
+            path: treePath,
+            mode: '100644',
+            type: 'blob',
+            content: file.content,
+          }),
+          'utf8',
+        ) >
+          MAX_UPLOAD_TREE_PAYLOAD_BYTES - 256,
     })
   }
 
@@ -440,8 +468,8 @@ export function planUploadTree(config, folder, files = []) {
   }
 }
 
-// `<sub-experiment>/<iteration>/results.csv`, with both folder levels trimmed. The file name itself is
-// fixed (`RESULTS_FILE_NAME`), and a path with a different shape is left to the validator to reject.
+// `<sub-experiment>/<iteration>/<file>`, with both folder levels trimmed. The filename is restricted
+// to the result CSVs accepted by the validator.
 export function shortenResultRelativePath(
   relativePath,
   subExperimentMaxLength = MAX_SUB_EXPERIMENT_SEGMENT_LENGTH,
@@ -478,32 +506,23 @@ function normalizeResultRelativePath(rawPath) {
   if (segments.some((segment) => segment === '.' || segment === '..')) {
     return null
   }
-  if (segments[segments.length - 1] !== RESULTS_FILE_NAME) {
+  if (!RESULTS_FILE_NAMES.has(segments[segments.length - 1])) {
     return null
   }
 
   return segments.join('/')
 }
 
-// Only folder-style `results.csv` files may be uploaded, and each of them has to name the experiment it
-// belongs to: `<experimentFolder>/<sub-experiment>/<iteration>/results.csv`. Anything else (path
-// traversal, absolute paths, other file types, a results.csv sitting directly in a sub-experiment
-// folder, a file without an experiment name, a file of the live `current` source) is refused instead of
-// being silently rewritten or committed into a folder shared by several runs.
+// Only folder-style result CSV files may be uploaded, and each of them has to name the experiment it
+// belongs to: `<experimentFolder>/<sub-experiment>/<iteration>/<file>`. Anything else (path traversal,
+// absolute paths, other file types, a CSV sitting directly in a sub-experiment folder, a file without an
+// experiment name, a file of the live `current` source) is refused instead of being silently rewritten or
+// committed into a folder shared by several runs.
 export function validateUploadFiles(files) {
   if (!Array.isArray(files) || files.length === 0) {
     return {
       ok: false,
-      error: 'No results.csv files were provided for the upload.',
-      files: [],
-      totalBytes: 0,
-    }
-  }
-
-  if (files.length > MAX_UPLOAD_FILES) {
-    return {
-      ok: false,
-      error: `Too many files in one upload (${files.length} > ${MAX_UPLOAD_FILES}).`,
+      error: 'No result CSV files were provided for the upload.',
       files: [],
       totalBytes: 0,
     }
@@ -518,7 +537,7 @@ export function validateUploadFiles(files) {
     if (!relativePath) {
       return {
         ok: false,
-        error: `Invalid results path "${String(entry?.path ?? '')}". Expected "<sub-experiment>/<iteration>/${RESULTS_FILE_NAME}".`,
+        error: `Invalid results path "${String(entry?.path ?? '')}". Expected "<sub-experiment>/<iteration>/results.csv" or "<sub-experiment>/<iteration>/results_from_json.csv".`,
         files: [],
         totalBytes: 0,
       }
@@ -561,10 +580,10 @@ export function validateUploadFiles(files) {
       }
     }
 
-    // The request body is JSON, so a `results.csv` travels base64-encoded, but the commit is created
+    // The request body is JSON, so a result CSV travels base64-encoded, but the commit is created
     // with the "create tree" endpoint, whose `content` is plain text (the Contents and Blobs endpoints
     // are the ones that take base64). Inlining the payload as it arrives is what made every committed
-    // `results.csv` hold its own base64 spelling instead of the CSV it stands for, so it is decoded
+    // result files hold their own base64 spelling instead of the CSV they stand for, so it is decoded
     // here, once, and only the decoded text reaches the tree.
     const decoded = Buffer.from(base64, 'base64')
     const bytes = decoded.length
@@ -574,7 +593,7 @@ export function validateUploadFiles(files) {
     if (bytes > MAX_UPLOAD_FILE_BYTES) {
       return {
         ok: false,
-        error: `"${relativePath}" is larger than the ${Math.round(MAX_UPLOAD_FILE_BYTES / (1024 * 1024))} MB per-file limit.`,
+        error: `"${relativePath}" is larger than GitHub's ${Math.round(MAX_UPLOAD_FILE_BYTES / (1024 * 1024))} MiB per-file limit.`,
         files: [],
         totalBytes: 0,
       }
@@ -593,20 +612,78 @@ export function validateUploadFiles(files) {
     }
 
     totalBytes += bytes
-    if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
-      return {
-        ok: false,
-        error: `The upload is larger than the ${Math.round(MAX_UPLOAD_TOTAL_BYTES / (1024 * 1024))} MB limit.`,
-        files: [],
-        totalBytes: 0,
-      }
-    }
-
     seenTreePaths.add(`${experimentFolder}/${relativePath}`)
-    validated.push({ experimentFolder, path: relativePath, content, bytes })
+    validated.push({
+      experimentFolder,
+      path: relativePath,
+      content,
+      contentBase64: base64,
+      bytes,
+      useBlob: bytes > MAX_INLINE_UPLOAD_FILE_BYTES,
+    })
   }
 
   return { ok: true, error: '', files: validated, totalBytes }
+}
+
+function serializedTreeEntryBytes(file) {
+  const entry = {
+    path: file.treePath,
+    mode: '100644',
+    type: 'blob',
+  }
+
+  if (file.useBlob) {
+    // Blob-backed files only contribute a SHA to the tree request. The actual blob is uploaded
+    // separately and is therefore not part of the tree payload.
+    entry.sha = '0'.repeat(40)
+  } else {
+    entry.content = file.content
+  }
+
+  return Buffer.byteLength(JSON.stringify(entry), 'utf8')
+}
+
+function splitUploadFiles(files) {
+  const batches = []
+  let batch = []
+  let batchBytes = 0
+  let batchTreePayloadBytes = Buffer.byteLength('{"tree":[]}', 'utf8')
+
+  for (const file of files) {
+    const entryBytes = serializedTreeEntryBytes(file)
+    const startsNewBatch =
+      batch.length > 0 &&
+      (
+        batch.length >= MAX_UPLOAD_FILES ||
+        batchBytes + file.bytes > MAX_UPLOAD_TOTAL_BYTES ||
+        batchTreePayloadBytes + entryBytes + 1 > MAX_UPLOAD_TREE_PAYLOAD_BYTES
+      )
+
+    if (startsNewBatch) {
+      batches.push(batch)
+      batch = []
+      batchBytes = 0
+      batchTreePayloadBytes = Buffer.byteLength('{"tree":[]}', 'utf8')
+    }
+
+    batch.push(file)
+    batchBytes += file.bytes
+    // One byte accounts for the comma between entries. The small fixed wrapper and base_tree
+    // field are covered by the conservative headroom in MAX_UPLOAD_TREE_PAYLOAD_BYTES.
+    batchTreePayloadBytes += entryBytes + 1
+  }
+
+  if (batch.length > 0) {
+    batches.push(batch)
+  }
+
+  return batches
+}
+
+function normalizeUploadMode(value) {
+  const mode = String(value ?? '').trim().toLowerCase()
+  return UPLOAD_MODES.has(mode) ? mode : 'full'
 }
 
 function buildWebBaseUrl(config) {
@@ -678,12 +755,17 @@ function assertGitHubResponse(action, { response, payload }) {
   )
 }
 
-// Creates one commit holding every file of a single upload. The tree is sent with the previous tree
-// as `base_tree` and the blob contents inlined, so the upload costs four API calls (branch ref, tree,
-// commit, ref update) no matter how many iterations it carries, and re-uploading identical results
-// creates no commit at all. The inlined contents are the decoded CSVs `validateUploadFiles` produced,
-// which is what keeps the committed files readable as CSV.
-export async function uploadResults({ config, folder, files, commitMessage, fetchImpl } = {}) {
+// Creates one or more sequential commits holding the files of a logical upload. Each tree is sent
+// with the current branch tree as `base_tree`, keeping every commit cumulative while respecting the
+// per-commit limits above. Re-uploading identical results creates no commits.
+export async function uploadResults({
+  config,
+  folder,
+  files,
+  commitMessage,
+  uploadMode = 'full',
+  fetchImpl,
+} = {}) {
   if (!isGitHubConfigured(config)) {
     throw new GitHubUploadError(
       'GitHub upload is not configured. Set GITHUB_TOKEN and GITHUB_REPO in .env and restart the tunnel manager.',
@@ -713,57 +795,7 @@ export async function uploadResults({ config, folder, files, commitMessage, fetc
   // into one folder, which would silently merge two experiments.
   const plan = planUploadTree(config, folder, validation.files)
   const folderPath = plan.folderPath
-
-  let baseCommitSha = null
-  let baseTreeSha = null
-
-  const refResult = await githubRequest({
-    ...requestOptions,
-    pathname: `/repos/${repo}/git/ref/heads/${branch}`,
-  })
-
-  if (refResult.response.ok) {
-    baseCommitSha = refResult.payload?.object?.sha || null
-
-    if (baseCommitSha) {
-      const commitResult = await githubRequest({
-        ...requestOptions,
-        pathname: `/repos/${repo}/git/commits/${baseCommitSha}`,
-      })
-      assertGitHubResponse(`read the ${branch} branch tip`, commitResult)
-      baseTreeSha = commitResult.payload?.tree?.sha || null
-    }
-  } else if (refResult.response.status !== 404 && refResult.response.status !== 409) {
-    // 404/409 mean the branch (or the whole repository) is still empty: the commit below then creates
-    // `refs/heads/<branch>` from scratch.
-    assertGitHubResponse(`read the ${branch} branch`, refResult)
-  }
-
-  const treeBody = {
-    tree: plan.files.map((file) => ({
-      path: file.treePath,
-      mode: '100644',
-      type: 'blob',
-      content: file.content,
-    })),
-  }
-
-  if (baseTreeSha) {
-    treeBody.base_tree = baseTreeSha
-  }
-
-  const treeResult = await githubRequest({
-    ...requestOptions,
-    pathname: `/repos/${repo}/git/trees`,
-    method: 'POST',
-    body: treeBody,
-  })
-  assertGitHubResponse('create the upload tree', treeResult)
-
-  const treeSha = treeResult.payload?.sha || null
-  if (!treeSha) {
-    throw new GitHubUploadError('GitHub did not return a tree for the upload.', 502)
-  }
+  const mode = normalizeUploadMode(uploadMode)
 
   const summary = {
     ok: true,
@@ -780,53 +812,210 @@ export async function uploadResults({ config, folder, files, commitMessage, fetc
     // Names git could not check out, as they appear in the repository instead: `count` says how many
     // were shortened and `examples` shows the first few, so the dashboard can say so in its notice.
     trimmed: plan.trimmed,
+    uploadMode: mode,
     webUrl: `${buildWebBaseUrl(config)}/${repo}`,
   }
+  let filesToUpload = plan.files
+  let baseCommitSha = null
+  let baseTreeSha = null
+  let latestTreeSha = null
+  let commitsCreated = 0
 
-  if (baseTreeSha && treeSha === baseTreeSha) {
-    return { ...summary, unchanged: true, commitSha: baseCommitSha, commitUrl: `${summary.webUrl}/commit/${baseCommitSha}`, treeSha }
-  }
-
-  const commitResult = await githubRequest({
-    ...requestOptions,
-    pathname: `/repos/${repo}/git/commits`,
-    method: 'POST',
-    body: {
-      message: buildCommitMessage(commitMessage, folder),
-      tree: treeSha,
-      parents: baseCommitSha ? [baseCommitSha] : [],
-    },
-  })
-  assertGitHubResponse('create the upload commit', commitResult)
-
-  const commitSha = commitResult.payload?.sha || null
-  if (!commitSha) {
-    throw new GitHubUploadError('GitHub did not return a commit for the upload.', 502)
-  }
-
-  if (baseCommitSha) {
-    const updateResult = await githubRequest({
+  if (mode === 'update') {
+    const refResult = await githubRequest({
       ...requestOptions,
-      pathname: `/repos/${repo}/git/refs/heads/${branch}`,
-      method: 'PATCH',
-      body: { sha: commitSha, force: false },
+      pathname: `/repos/${repo}/git/ref/heads/${branch}`,
     })
-    assertGitHubResponse(`update the ${branch} branch`, updateResult)
-  } else {
-    const createResult = await githubRequest({
+    if (refResult.response.ok) {
+      baseCommitSha = refResult.payload?.object?.sha || null
+      if (baseCommitSha) {
+        const commitResult = await githubRequest({
+          ...requestOptions,
+          pathname: `/repos/${repo}/git/commits/${baseCommitSha}`,
+        })
+        assertGitHubResponse(`read the ${branch} branch tip`, commitResult)
+        baseTreeSha = commitResult.payload?.tree?.sha || null
+      }
+    } else if (refResult.response.status !== 404 && refResult.response.status !== 409) {
+      assertGitHubResponse(`read the ${branch} branch`, refResult)
+    }
+
+    if (baseTreeSha) {
+      const treeResult = await githubRequest({
+        ...requestOptions,
+        pathname: `/repos/${repo}/git/trees/${baseTreeSha}?recursive=1`,
+      })
+      assertGitHubResponse('read the existing results tree', treeResult)
+      if (treeResult.payload?.truncated) {
+        throw new GitHubUploadError(
+          'GitHub returned a truncated repository tree, so update upload cannot safely check every result file.',
+          502,
+        )
+      }
+
+      const existingPaths = new Set(
+        (treeResult.payload?.tree || [])
+          .filter((entry) => entry?.type === 'blob')
+          .map((entry) => entry.path),
+      )
+      const completeIterations = new Set()
+      for (const file of plan.files) {
+        if (
+          RESULTS_FILE_NAMES.has(file.path.split('/').pop()) &&
+          existingPaths.has(file.treePath)
+        ) {
+          const iterationPath = file.treePath.slice(0, file.treePath.lastIndexOf('/'))
+          const pair = `${iterationPath}/results.csv`
+          const jsonPair = `${iterationPath}/results_from_json.csv`
+          if (existingPaths.has(pair) && existingPaths.has(jsonPair)) {
+            completeIterations.add(iterationPath)
+          }
+        }
+      }
+      filesToUpload = plan.files.filter(
+        (file) => !completeIterations.has(file.treePath.slice(0, file.treePath.lastIndexOf('/'))),
+      )
+    }
+  }
+
+  summary.fileCount = filesToUpload.length
+  summary.skippedFileCount = plan.files.length - filesToUpload.length
+  if (filesToUpload.length === 0) {
+    summary.unchanged = true
+    summary.commitCount = 0
+    summary.batchCount = 0
+    return summary
+  }
+
+  const batches = splitUploadFiles(filesToUpload)
+
+  for (const [batchIndex, batch] of batches.entries()) {
+    const refResult = await githubRequest({
       ...requestOptions,
-      pathname: `/repos/${repo}/git/refs`,
+      pathname: `/repos/${repo}/git/ref/heads/${branch}`,
+    })
+
+    if (refResult.response.ok) {
+      baseCommitSha = refResult.payload?.object?.sha || null
+
+      if (baseCommitSha) {
+        const commitResult = await githubRequest({
+          ...requestOptions,
+          pathname: `/repos/${repo}/git/commits/${baseCommitSha}`,
+        })
+        assertGitHubResponse(`read the ${branch} branch tip`, commitResult)
+        baseTreeSha = commitResult.payload?.tree?.sha || null
+      }
+    } else if (refResult.response.status !== 404 && refResult.response.status !== 409) {
+      // 404/409 mean the branch (or the whole repository) is still empty.
+      assertGitHubResponse(`read the ${branch} branch`, refResult)
+    }
+
+    const treeBody = {
+      tree: [],
+    }
+
+    for (const file of batch) {
+      const treeEntry = {
+        path: file.treePath,
+        mode: '100644',
+        type: 'blob',
+      }
+
+      if (file.useBlob) {
+        const blobResult = await githubRequest({
+          ...requestOptions,
+          pathname: `/repos/${repo}/git/blobs`,
+          method: 'POST',
+          body: {
+            content: file.contentBase64,
+            encoding: 'base64',
+          },
+        })
+        assertGitHubResponse(`create the blob for ${file.treePath}`, blobResult)
+
+        const blobSha = blobResult.payload?.sha || null
+        if (!blobSha) {
+          throw new GitHubUploadError(`GitHub did not return a blob for ${file.treePath}.`, 502)
+        }
+        treeEntry.sha = blobSha
+      } else {
+        treeEntry.content = file.content
+      }
+
+      treeBody.tree.push(treeEntry)
+    }
+
+    if (baseTreeSha) {
+      treeBody.base_tree = baseTreeSha
+    }
+
+    const treeResult = await githubRequest({
+      ...requestOptions,
+      pathname: `/repos/${repo}/git/trees`,
       method: 'POST',
-      body: { ref: `refs/heads/${branch}`, sha: commitSha },
+      body: treeBody,
     })
-    assertGitHubResponse(`create the ${branch} branch`, createResult)
+    assertGitHubResponse('create the upload tree', treeResult)
+
+    const treeSha = treeResult.payload?.sha || null
+    if (!treeSha) {
+      throw new GitHubUploadError('GitHub did not return a tree for the upload.', 502)
+    }
+    latestTreeSha = treeSha
+
+    if (baseTreeSha && treeSha === baseTreeSha) {
+      continue
+    }
+
+    const messageSuffix = batches.length > 1 ? ` (part ${batchIndex + 1}/${batches.length})` : ''
+    const commitResult = await githubRequest({
+      ...requestOptions,
+      pathname: `/repos/${repo}/git/commits`,
+      method: 'POST',
+      body: {
+        message: `${buildCommitMessage(commitMessage, folder)}${messageSuffix}`,
+        tree: treeSha,
+        parents: baseCommitSha ? [baseCommitSha] : [],
+      },
+    })
+    assertGitHubResponse('create the upload commit', commitResult)
+
+    const commitSha = commitResult.payload?.sha || null
+    if (!commitSha) {
+      throw new GitHubUploadError('GitHub did not return a commit for the upload.', 502)
+    }
+
+    if (baseCommitSha) {
+      const updateResult = await githubRequest({
+        ...requestOptions,
+        pathname: `/repos/${repo}/git/refs/heads/${branch}`,
+        method: 'PATCH',
+        body: { sha: commitSha, force: false },
+      })
+      assertGitHubResponse(`update the ${branch} branch`, updateResult)
+    } else {
+      const createResult = await githubRequest({
+        ...requestOptions,
+        pathname: `/repos/${repo}/git/refs`,
+        method: 'POST',
+        body: { ref: `refs/heads/${branch}`, sha: commitSha },
+      })
+      assertGitHubResponse(`create the ${branch} branch`, createResult)
+    }
+
+    baseCommitSha = commitSha
+    baseTreeSha = treeSha
+    commitsCreated += 1
   }
 
   return {
     ...summary,
-    unchanged: false,
-    commitSha,
-    commitUrl: `${summary.webUrl}/commit/${commitSha}`,
-    treeSha,
+    unchanged: commitsCreated === 0,
+    commitCount: commitsCreated,
+    commitSha: baseCommitSha,
+    commitUrl: baseCommitSha ? `${summary.webUrl}/commit/${baseCommitSha}` : '',
+    treeSha: latestTreeSha,
+    batchCount: batches.length,
   }
 }

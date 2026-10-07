@@ -59,6 +59,37 @@
   white-space: nowrap;
 }
 
+.upload-progress {
+  margin: 0 2rem 0.85rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid rgba(31, 95, 255, 0.3);
+  border-radius: 10px;
+  background: rgba(31, 95, 255, 0.08);
+  color: var(--ink-900);
+  font-size: 0.85rem;
+}
+
+.upload-progress-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.4rem;
+}
+
+.upload-progress-current {
+  margin-bottom: 0.4rem;
+  overflow-wrap: anywhere;
+  color: var(--ink-700);
+  font-size: 0.8rem;
+}
+
+.upload-progress progress {
+  display: block;
+  width: 100%;
+  height: 0.55rem;
+  accent-color: #1f5fff;
+}
+
 .tunnel-strip {
   margin: 0 1rem 0.9rem;
   border-radius: 12px;
@@ -851,6 +882,27 @@
 .button-group {
   display: flex;
   gap: 0.5rem;
+  align-items: center;
+}
+
+.upload-mode-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--ink-700);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+.upload-mode-control select {
+  max-width: 11rem;
+  border: 1px solid var(--line-300);
+  border-radius: 7px;
+  background: #ffffff;
+  color: var(--ink-900);
+  font-family: var(--ui-font);
+  font-size: 0.72rem;
+  padding: 0.3rem 0.35rem;
 }
 
 .download-menu-wrapper {

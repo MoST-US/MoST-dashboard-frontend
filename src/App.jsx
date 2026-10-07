@@ -1094,37 +1094,54 @@ function blobToBase64(blob) {
 }
 
 // The GitHub upload sends exactly the folder-style tree the ZIP download builds, so both paths share
-// this collector: one `<sub-experiment>/<iteration>/results.csv` entry per iteration, base64-encoded
+// this collector: one `<sub-experiment>/<iteration>/<file>` entry per available file, base64-encoded
 // because it travels inside a JSON body. Every entry also carries the experiment (results source) it
 // was read from, because that is the folder level the upload names after the experiment; the ZIP
 // download ignores the field and keeps using `path` alone.
-async function collectExperimentResultFiles(experiment, port, resultsScope) {
-  const iterationResponse = await fetchJson(
-    `/api/experiments/${encodeURIComponent(experiment)}/iterations`,
-    port,
-    { resultsScope },
-  )
-  const iterations = iterationResponse.iterations || []
+async function collectExperimentResultFiles(
+  experiment,
+  port,
+  resultsScope,
+  fileNames = ['results.csv'],
+  onProgress,
+  iterationNames,
+) {
+  const iterations = iterationNames || (
+    await fetchJson(
+      `/api/experiments/${encodeURIComponent(experiment)}/iterations`,
+      port,
+      { resultsScope },
+    )
+  ).iterations || []
   const files = []
   const experimentFolder = buildUploadExperimentFolder(resultsScope)
 
   for (const iterationName of iterations) {
-    const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/results.csv`
-    const response = await fetch(buildApiUrl(endpoint, port, { resultsScope }))
-    if (!response.ok) {
-      continue
-    }
+    for (const fileName of fileNames) {
+      onProgress?.({
+        experiment: experimentFolder,
+        subExperiment: experiment,
+      })
+      const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/${fileName}`
+      const response = await fetch(buildApiUrl(endpoint, port, { resultsScope }))
+      if (!response.ok) {
+        onProgress?.({ completed: 1 })
+        continue
+      }
 
-    const contentBase64 = await blobToBase64(await response.blob())
-    if (!contentBase64) {
-      continue
-    }
+      const contentBase64 = await blobToBase64(await response.blob())
+      if (!contentBase64) {
+        onProgress?.({ completed: 1 })
+        continue
+      }
 
-    files.push({
-      path: `${experiment}/${iterationName}/results.csv`,
-      experimentFolder,
-      contentBase64,
-    })
+      files.push({
+        path: `${experiment}/${iterationName}/${fileName}`,
+        experimentFolder,
+        contentBase64,
+      })
+      onProgress?.({ ready: 1, completed: 1 })
+    }
   }
 
   return files
@@ -1215,7 +1232,43 @@ function normalizeUploadExperimentEntries(experiments, fallbackResultsScope) {
 function buildUploadCommitMessage({ model, experimentCount, fileCount, sourceLabel }) {
   const scope = sourceLabel ? ` (${sourceLabel})` : ''
   const experimentLabel = experimentCount === 1 ? 'experiment' : 'experiments'
-  return `Add ${experimentCount} ${experimentLabel} from ${model}: ${fileCount} results.csv file(s) via MoST-dashboard${scope}`
+  return `Add ${experimentCount} ${experimentLabel} from ${model}: ${fileCount} result CSV file(s) via MoST-dashboard${scope}`
+}
+
+// Keep request bodies below the tunnel manager's 256 MiB limit. The margin accounts for differences
+// between the browser's serialized request and the server's streamed byte count.
+const MAX_GITHUB_UPLOAD_REQUEST_BYTES = 240 * 1024 * 1024
+const uploadTextEncoder = new TextEncoder()
+
+function serializedUploadSize({ model, node, gpuCount, commitMessage, files }) {
+  return uploadTextEncoder.encode(JSON.stringify({ model, node, gpuCount, commitMessage, files })).length
+}
+
+function splitGitHubUploadFiles({ model, node, gpuCount, commitMessage, files }) {
+  const batches = []
+  let batch = []
+
+  const addBatch = () => {
+    if (batch.length > 0) {
+      batches.push(batch)
+      batch = []
+    }
+  }
+
+  for (const file of files) {
+    const candidate = [...batch, file]
+    if (
+      batch.length > 0 &&
+      serializedUploadSize({ model, node, gpuCount, commitMessage, files: candidate }) >
+        MAX_GITHUB_UPLOAD_REQUEST_BYTES
+    ) {
+      addBatch()
+    }
+    batch.push(file)
+  }
+  addBatch()
+
+  return batches
 }
 
 async function fetchGitHubUploadStatus() {
@@ -1229,11 +1282,11 @@ async function fetchGitHubUploadStatus() {
 
 // The commit is created by the tunnel manager, which is the only process that ever sees the GitHub
 // token (it lives in the server-side .env, never in this bundle).
-async function requestGitHubUpload({ model, node, gpuCount, files, commitMessage }) {
+async function requestGitHubUpload({ model, node, gpuCount, files, commitMessage, uploadMode }) {
   const response = await fetch(buildTunnelUrl('/github/upload'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, node, gpuCount, commitMessage, files }),
+    body: JSON.stringify({ model, node, gpuCount, commitMessage, uploadMode, files }),
   })
 
   let payload = null
@@ -1403,6 +1456,8 @@ function App() {
     message: '',
   })
   const [uploadBusyKey, setUploadBusyKey] = useState('')
+  const [githubUploadMode, setGitHubUploadMode] = useState('update')
+  const [uploadProgress, setUploadProgress] = useState(null)
   const [uploadNotice, setUploadNotice] = useState(null)
   // Answers given through the GPU-count prompt, remembered per port for the rest of the session.
   const uploadGpuCountOverridesRef = useRef({})
@@ -2041,13 +2096,14 @@ function App() {
   }
 
   // The ZIP download and the GitHub upload read the results the same way, so both go through
-  // `collectExperimentResultFiles`: a folder tree of `<sub-experiment>/<iteration>/results.csv`. The ZIP
+  // `collectExperimentResultFiles`: a folder tree of `<sub-experiment>/<iteration>/<file>`. The ZIP
   // keeps that tree (the experiment level is only added to the repository path by the upload).
-  async function appendExperimentCsvToZip(experiment, zip) {
+  async function appendExperimentCsvToZip(experiment, zip, fileNames = ['results.csv']) {
     const files = await collectExperimentResultFiles(
       experiment,
       activeApiPort,
       selectedResultsScope,
+      fileNames,
     )
 
     for (const file of files) {
@@ -2111,6 +2167,48 @@ function App() {
       saveAs(zipBlob, `${buildResultsDownloadBaseName(selectedResultsScope)}-iterations-results-csv.zip`)
     } catch {
       setErrorMessage(`Unable to build matrix zip on port ${activeApiPort}.`)
+    } finally {
+      setBusyMatrixDownload(false)
+    }
+  }
+
+  async function downloadMatrixResultsFromJsonCsvZip() {
+    if (busyMatrixDownload) {
+      return
+    }
+
+    setBusyMatrixDownload(true)
+    setErrorMessage('')
+
+    try {
+      if (downloadableExperiments.length === 0) {
+        setErrorMessage('No experiments available to download.')
+        return
+      }
+
+      const zip = new JSZip()
+      let fileCount = 0
+
+      for (const experiment of downloadableExperiments) {
+        try {
+          fileCount += await appendExperimentCsvToZip(experiment, zip, ['results_from_json.csv'])
+        } catch {
+          continue
+        }
+      }
+
+      if (fileCount === 0) {
+        setErrorMessage('No results_from_json.csv files found in the selected results source.')
+        return
+      }
+
+      const zipBlob = await zip.generateAsync({ type: 'blob' })
+      saveAs(
+        zipBlob,
+        `${buildResultsDownloadBaseName(selectedResultsScope)}-iterations-results-from-json-csv.zip`,
+      )
+    } catch {
+      setErrorMessage(`Unable to build results_from_json.csv matrix zip on port ${activeApiPort}.`)
     } finally {
       setBusyMatrixDownload(false)
     }
@@ -2263,15 +2361,16 @@ function App() {
   }
 
   // Shared by the three upload entry points: collect the folder-style results of the given experiments
-  // and commit them together, so one upload is always one commit. Every experiment travels with the
-  // results source it has to be read from, which is what lets one commit sweep several completed
-  // archives (`Experiment_*`) at once.
+  // and upload them together. Large uploads are split into request-sized batches. Every experiment
+  // travels with the results source it has to be read from, which lets one upload sweep several
+  // completed archives (`Experiment_*`) at once.
   async function uploadExperimentsToGitHub({
     port,
     experiments,
     busyKey,
     identity,
     skippedCount = 0,
+    uploadMode = 'full',
   }) {
     if (uploadBusyKey) {
       return
@@ -2295,6 +2394,7 @@ function App() {
     const sourceLabelSuffix = sourceCount > 1 ? ` across ${sourceLabel}` : ''
 
     setUploadBusyKey(busyKey)
+    setUploadProgress({ ready: 0, total: 0, phase: 'collecting' })
     setUploadNotice(null)
     setErrorMessage('')
 
@@ -2305,44 +2405,147 @@ function App() {
         return
       }
 
-      const files = []
       let experimentCount = 0
+      let preparedFileCount = 0
+      let completedFileCount = 0
+      let expectedFileCount = 0
+      const collectionPlans = []
+      let currentExperiment = ''
+      let currentSubExperiment = ''
+      const uploadResults = []
+      let uploadedFileCount = 0
 
       for (const entry of entries) {
         try {
-          const experimentFiles = await collectExperimentResultFiles(
-            entry.name,
+          const iterationResponse = await fetchJson(
+            `/api/experiments/${encodeURIComponent(entry.name)}/iterations`,
             port,
-            entry.resultsScope,
+            { resultsScope: entry.resultsScope },
           )
-          if (experimentFiles.length === 0) {
-            continue
-          }
-
-          files.push(...experimentFiles)
-          experimentCount += 1
+          const iterations = iterationResponse.iterations || []
+          const fileCount = iterations.length * 2
+          expectedFileCount += fileCount
+          collectionPlans.push({ entry, iterations })
         } catch {
-          // A folder that cannot be read is skipped; the remaining experiments still upload.
+          // A folder that cannot be listed is skipped; the remaining experiments still upload.
         }
       }
 
-      if (files.length === 0) {
-        setErrorMessage(`No results.csv files found to upload for port ${port}.`)
+      setUploadProgress({
+        ready: 0,
+        completed: 0,
+        total: expectedFileCount,
+        phase: 'collecting',
+      })
+
+      for (const { entry, iterations } of collectionPlans) {
+        let experimentFiles
+        try {
+          experimentFiles = await collectExperimentResultFiles(
+            entry.name,
+            port,
+            entry.resultsScope,
+            ['results.csv', 'results_from_json.csv'],
+            ({
+              ready = 0,
+              completed = 0,
+              experiment = '',
+              subExperiment = '',
+            } = {}) => {
+              preparedFileCount += ready
+              completedFileCount += completed
+              currentExperiment = experiment
+              currentSubExperiment = subExperiment
+              setUploadProgress({
+                ready: preparedFileCount,
+                completed: completedFileCount,
+                total: expectedFileCount,
+                phase: 'collecting',
+                experiment,
+                subExperiment,
+              })
+            },
+            iterations,
+          )
+        } catch {
+          // A folder that cannot be read is skipped; the remaining experiments still upload.
+          continue
+        }
+
+        if (experimentFiles.length === 0) {
+          continue
+        }
+
+        experimentCount += 1
+
+        // Upload one archive as soon as it has been collected instead of retaining every archive's
+        // base64 payload in the browser until the whole sweep finishes.
+        setUploadProgress({
+          ready: preparedFileCount,
+          completed: completedFileCount,
+          total: expectedFileCount,
+          phase: 'uploading',
+          experiment: currentExperiment,
+          subExperiment: currentSubExperiment,
+        })
+        const experimentCommitMessage = buildUploadCommitMessage({
+          model: target.model,
+          experimentCount: 1,
+          fileCount: experimentFiles.length,
+          sourceLabel,
+        })
+        const requestBatches = splitGitHubUploadFiles({
+          model: target.model,
+          node: target.node,
+          gpuCount: target.gpuCount,
+          commitMessage: experimentCommitMessage,
+          files: experimentFiles,
+        })
+        for (const [batchIndex, batch] of requestBatches.entries()) {
+          uploadResults.push(
+            await requestGitHubUpload({
+              model: target.model,
+              node: target.node,
+              gpuCount: target.gpuCount,
+              commitMessage:
+                requestBatches.length > 1
+                  ? `${experimentCommitMessage} (part ${batchIndex + 1}/${requestBatches.length})`
+                  : experimentCommitMessage,
+              uploadMode,
+              files: batch,
+            }),
+          )
+          uploadedFileCount += batch.length
+          setUploadProgress({
+            ready: preparedFileCount,
+            completed: completedFileCount,
+            total: expectedFileCount,
+            phase: 'uploading',
+            experiment: currentExperiment,
+            subExperiment: currentSubExperiment,
+          })
+        }
+      }
+
+      if (uploadedFileCount === 0) {
+        setErrorMessage(`No results files found to upload for port ${port}.`)
         return
       }
 
-      const result = await requestGitHubUpload({
-        model: target.model,
-        node: target.node,
-        gpuCount: target.gpuCount,
-        commitMessage: buildUploadCommitMessage({
-          model: target.model,
-          experimentCount,
-          fileCount: files.length,
-          sourceLabel,
-        }),
-        files,
-      })
+      const result = {
+        ...uploadResults[uploadResults.length - 1],
+        unchanged: uploadResults.every((entry) => entry.unchanged),
+        commitCount: uploadResults.reduce((count, entry) => count + (entry.commitCount || 0), 0),
+        batchCount: uploadResults.reduce((count, entry) => count + (entry.batchCount || 0), 0),
+        fileCount: uploadedFileCount,
+        experimentFolders: [
+          ...new Set(uploadResults.flatMap((entry) => entry.experimentFolders || [])),
+        ],
+        trimmed: {
+          count: uploadResults.reduce((count, entry) => count + (entry.trimmed?.count || 0), 0),
+          examples: uploadResults.flatMap((entry) => entry.trimmed?.examples || []).slice(0, 10),
+        },
+      }
 
       const targetPath = result.folderPath || result.folder
       const experimentFolders = Array.isArray(result.experimentFolders) ? result.experimentFolders : []
@@ -2380,6 +2583,7 @@ function App() {
       )
     } finally {
       setUploadBusyKey('')
+      setUploadProgress(null)
     }
   }
 
@@ -2393,6 +2597,7 @@ function App() {
     }
 
     setUploadBusyKey('matrix-completed')
+    setUploadProgress({ ready: 0, total: 0, phase: 'collecting' })
     setUploadNotice(null)
     setErrorMessage('')
 
@@ -2402,6 +2607,7 @@ function App() {
       collected = await collectFinishedExperimentsFromCompletedSources(activeApiPort)
     } catch {
       setUploadBusyKey('')
+      setUploadProgress(null)
       setErrorMessage(
         `Unable to list the completed results sources of port ${activeApiPort} for the upload.`,
       )
@@ -2409,6 +2615,7 @@ function App() {
     }
 
     setUploadBusyKey('')
+    setUploadProgress(null)
 
     if (collected.experiments.length === 0) {
       setErrorMessage(
@@ -2423,11 +2630,12 @@ function App() {
       busyKey: 'matrix-completed',
       identity: portIdentityByPort[activeApiPort],
       skippedCount: collected.skipped.length,
+      uploadMode: githubUploadMode,
     })
   }
 
   // Matrix button: the whole matrix the panel shows — every matrix cell, or every `mix_...`
-  // sub-experiment of an additive source — instead of only the selected one, in one commit, read from
+  // sub-experiment of an additive source — instead of only the selected one, read from
   // the results source the dashboard is viewing. FINISHED is what makes a sub-experiment uploadable,
   // so the cells of a run that is still in progress are skipped instead of blocking the rest; a
   // completed archive is covered in full by the menu entry above. The experiment level of the committed
@@ -2454,11 +2662,12 @@ function App() {
       busyKey: 'matrix-viewed',
       identity: portIdentityByPort[activeApiPort],
       skippedCount: downloadableExperiments.length - finishedDownloadableExperiments.length,
+      uploadMode: githubUploadMode,
     })
   }
 
-  // Per-tunnel button: every finished sub-experiment of every completed results source of the port, in
-  // a single commit. The ongoing `current` source is not part of that set (see
+  // Per-tunnel button: every finished sub-experiment of every completed results source of the port.
+  // The ongoing `current` source is not part of that set (see
   // collectFinishedExperimentsFromCompletedSources), so a run that is still executing is never
   // committed halfway: the archive it becomes is uploaded once the run ends. This works for a port the
   // dashboard is not currently viewing as well, since the sources are listed for that port.
@@ -2468,6 +2677,7 @@ function App() {
     }
 
     setUploadBusyKey(`port:${port}`)
+    setUploadProgress({ ready: 0, total: 0, phase: 'collecting' })
     setUploadNotice(null)
     setErrorMessage('')
 
@@ -2477,6 +2687,7 @@ function App() {
       collected = await collectFinishedExperimentsFromCompletedSources(port)
     } catch {
       setUploadBusyKey('')
+      setUploadProgress(null)
       setErrorMessage(
         `Unable to list the completed results sources of port ${port} for the upload.`,
       )
@@ -2484,6 +2695,7 @@ function App() {
     }
 
     setUploadBusyKey('')
+    setUploadProgress(null)
 
     if (collected.experiments.length === 0) {
       setErrorMessage(
@@ -2502,6 +2714,7 @@ function App() {
       busyKey: `port:${port}`,
       identity: portIdentityByPort[port],
       skippedCount: collected.skipped.length,
+      uploadMode: githubUploadMode,
     })
   }
 
@@ -2911,7 +3124,7 @@ function App() {
                     }
                     title={
                       githubStatus.configured
-                        ? `Upload every finished experiment of every completed results source of port ${port} to GitHub in one commit`
+                        ? `Upload every finished experiment of every completed results source of port ${port} to GitHub`
                         : githubStatus.message || 'GitHub uploads are not configured.'
                     }
                   >
@@ -2926,6 +3139,43 @@ function App() {
       </section>
 
       {errorMessage && <div className="error-banner">{errorMessage}</div>}
+
+      {uploadProgress && (
+        <div className="upload-progress" role="status" aria-live="polite">
+          <div className="upload-progress-label">
+            <span>
+              {uploadProgress.phase === 'uploading'
+                ? `Uploading ${uploadProgress.ready} file(s) to GitHub...`
+                : uploadProgress.total > 0
+                  ? `Preparing upload: ${uploadProgress.ready} of ${uploadProgress.total} file(s) ready`
+                  : 'Preparing upload: finding result files...'}
+            </span>
+            {uploadProgress.total > 0 && (
+              <span>
+                {(
+                  Math.floor(
+                    ((uploadProgress.completed ?? uploadProgress.ready) / uploadProgress.total) *
+                      1000 +
+                      Number.EPSILON * 1000,
+                  ) / 10
+                ).toFixed(1)}
+                %
+              </span>
+            )}
+          </div>
+          {(uploadProgress.experiment || uploadProgress.subExperiment) && (
+              <div className="upload-progress-current">
+                {uploadProgress.experiment && `Experiment: ${uploadProgress.experiment}`}
+                {uploadProgress.subExperiment && ` · Sub-experiment: ${uploadProgress.subExperiment}`}
+              </div>
+          )}
+          <progress
+            value={Math.min(uploadProgress.completed ?? uploadProgress.ready, uploadProgress.total)}
+            max={Math.max(uploadProgress.total, 1)}
+            aria-label="GitHub upload file preparation progress"
+          />
+        </div>
+      )}
 
       {uploadNotice && (
         <div className="upload-banner" role="status">
@@ -2951,6 +3201,18 @@ function App() {
                   : 'Experiments Matrix'}
             </h2>
             <div className="button-group">
+              <label className="upload-mode-control">
+                <span>GitHub upload</span>
+                <select
+                  value={githubUploadMode}
+                  onChange={(event) => setGitHubUploadMode(event.target.value)}
+                  disabled={Boolean(uploadBusyKey)}
+                  aria-label="GitHub upload mode"
+                >
+                  <option value="update">Update (missing iterations only)</option>
+                  <option value="full">Full upload</option>
+                </select>
+              </label>
               <div className="download-menu-wrapper" ref={matrixDownloadMenuRef}>
                 <button
                   type="button"
@@ -2992,6 +3254,17 @@ function App() {
                       }}
                     >
                       Merged CSV (single file)
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="download-menu-item"
+                      onClick={() => {
+                        setMatrixDownloadMenuOpen(false)
+                        downloadMatrixResultsFromJsonCsvZip()
+                      }}
+                    >
+                      results_from_json.csv (folder structure)
                     </button>
                     <button
                       type="button"
@@ -3435,6 +3708,15 @@ function App() {
               disabled={!selectedIteration}
               className="icon-button"
               title="Download results.json"
+            >
+              <Download size={16} />
+            </button>
+            <button
+              type="button"
+              onClick={() => downloadIterationFile('results_from_json.csv')}
+              disabled={!selectedIteration}
+              className="icon-button"
+              title="Download results_from_json.csv"
             >
               <Download size={16} />
             </button>
