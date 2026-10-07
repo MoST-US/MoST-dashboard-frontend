@@ -5,10 +5,17 @@ import http from 'node:http'
 import { fileURLToPath } from 'node:url'
 import {
   MAX_UPLOAD_BODY_BYTES,
+  MAX_UPLOAD_FILE_BYTES,
+  abortUploadSession,
+  addUploadSessionFile,
   buildResultsFolderName,
+  commitUploadSession,
+  createUploadSession,
   describeGitHubConfig,
+  getUploadSessionCount,
   isGitHubConfigured,
   listGpuNodes,
+  pruneUploadSessions,
   readGitHubConfig,
   resolveGpuTypeForNode,
   uploadResults,
@@ -472,6 +479,55 @@ async function readJsonBodyLimited(req, maxBytes) {
   })
 }
 
+// Same contract as `readJsonBodyLimited`, but for a request whose body is the file itself: one result
+// CSV posted as raw bytes (not base64 inside JSON). It buffers at most `maxBytes` and answers 413 as
+// soon as the limit is passed, so a runaway upload cannot pin the manager's heap.
+async function readRawBodyLimited(req, maxBytes) {
+  return new Promise((resolve) => {
+    const chunks = []
+    let size = 0
+    let settled = false
+
+    const finish = (result) => {
+      if (!settled) {
+        settled = true
+        resolve(result)
+      }
+    }
+
+    req.on('data', (chunk) => {
+      if (settled) {
+        return
+      }
+
+      size += chunk.length
+      if (size > maxBytes) {
+        finish({
+          ok: false,
+          statusCode: 413,
+          error: `The uploaded file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB.`,
+        })
+        return
+      }
+
+      chunks.push(chunk)
+    })
+
+    req.on('end', () => {
+      if (chunks.length === 0) {
+        finish({ ok: false, statusCode: 400, error: 'The uploaded file is empty.' })
+        return
+      }
+
+      finish({ ok: true, content: Buffer.concat(chunks) })
+    })
+
+    req.on('error', () =>
+      finish({ ok: false, statusCode: 400, error: 'Unable to read the uploaded file.' }),
+    )
+  })
+}
+
 function jsonResponse(res, statusCode, payload) {
   res.statusCode = statusCode
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -595,6 +651,154 @@ async function handleGitHubUpload(req, res) {
   }
 }
 
+// Opens the streaming upload session an experiment's files are posted into one by one. The folder is
+// resolved here (exactly as the one-shot upload did) so the browser only ever sends the raw CSVs.
+async function handleGitHubUploadSessionStart(req, res) {
+  if (!isGitHubConfigured(githubConfig)) {
+    jsonResponse(res, 409, {
+      error: describeGitHubConfig(githubConfig).message || 'GitHub upload is not configured.',
+    })
+    return
+  }
+
+  const body = await readJsonBodyLimited(req, 1024 * 1024)
+  if (!body.ok) {
+    jsonResponse(res, body.statusCode, { error: body.error })
+    return
+  }
+
+  const payload = body.value
+  const model = typeof payload.model === 'string' ? payload.model.trim() : ''
+  const node = typeof payload.node === 'string' ? payload.node.trim() : ''
+  const gpuCount = Number(payload.gpuCount)
+  const uploadMode = payload.uploadMode === 'update' ? 'update' : 'full'
+  const experimentFolder =
+    typeof payload.experimentFolder === 'string' ? payload.experimentFolder.trim() : ''
+
+  if (!model) {
+    jsonResponse(res, 400, { error: 'A model name is required to build the upload folder.' })
+    return
+  }
+
+  if (!node) {
+    jsonResponse(res, 400, { error: 'The GPU host (node) is required to resolve the GPU type.' })
+    return
+  }
+
+  const gpuType = resolveGpuTypeForNode(githubConfig.gpuTypeMap, node)
+  if (!gpuType) {
+    jsonResponse(res, 400, {
+      error: `Node "${node}" is not mapped to a GPU type. Known nodes: ${listGpuNodes(githubConfig.gpuTypeMap).join(', ')}. Extend GPU_TYPE_MAP in .env.`,
+    })
+    return
+  }
+
+  const folderName = buildResultsFolderName({ model, gpuType, gpuCount })
+  if (!folderName.ok) {
+    jsonResponse(res, 400, { error: folderName.error })
+    return
+  }
+
+  try {
+    const session = await createUploadSession({
+      config: githubConfig,
+      folder: folderName.folder,
+      experimentFolder,
+      uploadMode,
+      commitMessage: typeof payload.commitMessage === 'string' ? payload.commitMessage : '',
+    })
+
+    console.log(
+      `[github] upload session ${session.id} opened for ${session.folderPath}/${session.experimentFolder} (${session.mode})`,
+    )
+
+    jsonResponse(res, 200, {
+      sessionId: session.id,
+      folder: session.folder,
+      folderPath: session.folderPath,
+      gpuType,
+      node,
+      gpuCount,
+    })
+  } catch (error) {
+    const statusCode =
+      error instanceof Error && Number.isInteger(error.statusCode) ? error.statusCode : 502
+
+    jsonResponse(res, statusCode, {
+      error: error instanceof Error ? error.message : 'Unable to start the GitHub upload session.',
+    })
+  }
+}
+
+// Adds one raw result CSV (the request body itself) to an open session.
+async function handleGitHubUploadSessionFile(req, res, sessionId, urlObject) {
+  if (!isGitHubConfigured(githubConfig)) {
+    jsonResponse(res, 409, {
+      error: describeGitHubConfig(githubConfig).message || 'GitHub upload is not configured.',
+    })
+    return
+  }
+
+  const relativePath = urlObject.searchParams.get('path') || ''
+  if (!relativePath) {
+    jsonResponse(res, 400, { error: 'A "path" query parameter is required.' })
+    return
+  }
+
+  const body = await readRawBodyLimited(req, MAX_UPLOAD_FILE_BYTES)
+  if (!body.ok) {
+    jsonResponse(res, body.statusCode, { error: body.error })
+    return
+  }
+
+  try {
+    const result = await addUploadSessionFile({ id: sessionId, relativePath, content: body.content })
+    jsonResponse(res, 200, result)
+  } catch (error) {
+    const statusCode =
+      error instanceof Error && Number.isInteger(error.statusCode) ? error.statusCode : 502
+
+    jsonResponse(res, statusCode, {
+      error: error instanceof Error ? error.message : 'Unable to add the file to the GitHub upload.',
+    })
+  }
+}
+
+// Commits the session (one commit per results source, or bounded parts for a large one) and closes it.
+async function handleGitHubUploadSessionCommit(req, res, sessionId) {
+  if (!isGitHubConfigured(githubConfig)) {
+    jsonResponse(res, 409, {
+      error: describeGitHubConfig(githubConfig).message || 'GitHub upload is not configured.',
+    })
+    return
+  }
+
+  try {
+    const result = await commitUploadSession({ id: sessionId })
+    logShortenedUploadNames(result)
+
+    console.log(
+      `[github] upload session ${sessionId} closed: ${result.commitCount} commit(s), ${result.fileCount} file(s) to ${result.folderPath}${describeUploadExperiments(result.experimentFolders)}`,
+    )
+
+    jsonResponse(res, 200, {
+      ...result,
+      message: result.unchanged
+        ? `No new results to commit for ${result.folderPath}: the repository already has this content.`
+        : `Uploaded ${result.fileCount} file(s) to ${result.folderPath}${describeUploadExperiments(result.experimentFolders)}${
+            result.batchCount > 1 ? ` in ${result.batchCount} commits` : ''
+          }.`,
+    })
+  } catch (error) {
+    const statusCode =
+      error instanceof Error && Number.isInteger(error.statusCode) ? error.statusCode : 502
+
+    jsonResponse(res, statusCode, {
+      error: error instanceof Error ? error.message : 'Unable to commit the GitHub upload.',
+    })
+  }
+}
+
 async function requestHandler(req, res) {
   const urlObject = new URL(req.url || '/', 'http://localhost')
 
@@ -666,6 +870,30 @@ async function requestHandler(req, res) {
     return
   }
 
+  if (req.method === 'POST' && urlObject.pathname === '/github/upload/session') {
+    await handleGitHubUploadSessionStart(req, res)
+    return
+  }
+
+  const sessionFileMatch = /^\/github\/upload\/session\/([^/]+)\/file$/.exec(urlObject.pathname)
+  if (req.method === 'POST' && sessionFileMatch) {
+    await handleGitHubUploadSessionFile(req, res, sessionFileMatch[1], urlObject)
+    return
+  }
+
+  const sessionCommitMatch = /^\/github\/upload\/session\/([^/]+)\/commit$/.exec(urlObject.pathname)
+  if (req.method === 'POST' && sessionCommitMatch) {
+    await handleGitHubUploadSessionCommit(req, res, sessionCommitMatch[1])
+    return
+  }
+
+  const sessionAbortMatch = /^\/github\/upload\/session\/([^/]+)\/abort$/.exec(urlObject.pathname)
+  if (req.method === 'POST' && sessionAbortMatch) {
+    const aborted = abortUploadSession({ id: sessionAbortMatch[1] })
+    jsonResponse(res, 200, { ok: true, aborted })
+    return
+  }
+
   if (req.method === 'POST' && urlObject.pathname === '/github/upload') {
     await handleGitHubUpload(req, res)
     return
@@ -717,6 +945,25 @@ async function main() {
         : `GitHub uploads disabled: ${githubStatus.message}`,
     )
   })
+
+  // A sweep posts thousands of small files through this one long-lived process: drop the sessions the
+  // browser abandoned and, while an upload is in flight, log the heap so a leak (or an upload that
+  // never finished) is visible instead of only showing as `/status` going quiet.
+  const sessionJanitor = setInterval(() => {
+    const removed = pruneUploadSessions()
+    if (removed > 0) {
+      console.log(`[github] pruned ${removed} expired upload session(s)`)
+    }
+
+    const openSessions = getUploadSessionCount()
+    if (openSessions > 0) {
+      const memory = process.memoryUsage()
+      console.log(
+        `[github] ${openSessions} upload session(s) open, heapUsed ${Math.round(memory.heapUsed / (1024 * 1024))} MB, rss ${Math.round(memory.rss / (1024 * 1024))} MB`,
+      )
+    }
+  }, 60 * 1000)
+  sessionJanitor.unref?.()
 
   const shutdown = () => {
     managerState.stopping = true

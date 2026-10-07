@@ -29,7 +29,7 @@
 // experiment, sub-experiment or iteration it names survives the trimming, the mapping stays stable
 // (re-uploading the same results is still a no-op) and two long names never land in the same folder.
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 const DEFAULT_GITHUB_API_BASE_URL = 'https://api.github.com'
 const GITHUB_WEB_BASE_URL = 'https://github.com'
@@ -91,6 +91,16 @@ export const MAX_UPLOAD_FILES = 5000
 // Bodies carry base64 payloads, so the JSON envelope is larger than the raw results. This is the
 // request limit for a logical upload; individual GitHub commits stay within the limits above.
 export const MAX_UPLOAD_BODY_BYTES = 256 * 1024 * 1024
+
+// A single stalled GitHub hop must not pin an upload: every API call gets a deadline and a few retries
+// with backoff. A transient failure (a timeout, 408/429, a 5xx, or the secondary-rate-limit 403) is
+// retried; a 4xx that is a real answer (bad token, missing repo, rejected payload) comes back at once.
+// `Retry-After` and GitHub's rate-limit reset headers are honoured, so a throttled call waits as long
+// as it is told to instead of hammering the API.
+export const GITHUB_REQUEST_TIMEOUT_MS = 60000
+export const GITHUB_REQUEST_MAX_ATTEMPTS = 4
+const GITHUB_RETRY_BASE_DELAY_MS = 1000
+const GITHUB_RETRY_MAX_DELAY_MS = 30000
 
 export class GitHubUploadError extends Error {
   constructor(message, statusCode = 502) {
@@ -718,8 +728,59 @@ function describeGitHubFailure(response, payload) {
   return detail
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function backoffMs(attempt) {
+  const capped = Math.min(GITHUB_RETRY_MAX_DELAY_MS, GITHUB_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1))
+  return capped + Math.floor(Math.random() * 250)
+}
+
+// How long to wait before retrying, from the response when it says so. `Retry-After` (seconds or an HTTP
+// date) wins; otherwise GitHub's epoch-second rate-limit reset; otherwise null so the caller falls back
+// to exponential backoff.
+function retryAfterMs(response, payload) {
+  const retryAfter = response.headers.get('retry-after')
+  if (retryAfter) {
+    const seconds = Number(retryAfter)
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds * 1000
+    }
+    const date = Date.parse(retryAfter)
+    if (Number.isFinite(date)) {
+      return Math.max(0, date - Date.now())
+    }
+  }
+
+  const remaining = response.headers.get('x-ratelimit-remaining')
+  const reset = Number(response.headers.get('x-ratelimit-reset'))
+  if (remaining === '0' && Number.isFinite(reset) && reset > 0) {
+    return Math.max(0, reset * 1000 - Date.now())
+  }
+
+  return null
+}
+
+function isRetryableGitHubResponse(response, payload) {
+  if (response.status === 408 || response.status === 429 || response.status >= 500) {
+    return true
+  }
+  if (response.status === 403) {
+    // A permission 403 is terminal; only the rate-limit flavour is worth a retry.
+    const message = String(payload?.message || '').toLowerCase()
+    return (
+      response.headers.get('retry-after') !== null ||
+      response.headers.get('x-ratelimit-remaining') === '0' ||
+      message.includes('rate limit')
+    )
+  }
+  return false
+}
+
 async function githubRequest({ fetchImpl, config, pathname, method = 'GET', body }) {
-  const response = await fetchImpl(`${config.apiBaseUrl}${pathname}`, {
+  const url = `${config.apiBaseUrl}${pathname}`
+  const requestOptions = {
     method,
     headers: {
       Authorization: `Bearer ${config.token}`,
@@ -729,19 +790,54 @@ async function githubRequest({ fetchImpl, config, pathname, method = 'GET', body
       'User-Agent': 'MoST-dashboard',
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-  })
-
-  const text = await response.text()
-  let payload = null
-  if (text) {
-    try {
-      payload = JSON.parse(text)
-    } catch {
-      payload = null
-    }
   }
 
-  return { response, payload }
+  for (let attempt = 1; attempt <= GITHUB_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), GITHUB_REQUEST_TIMEOUT_MS)
+
+    let response
+    let payload = null
+    try {
+      response = await fetchImpl(url, { ...requestOptions, signal: controller.signal })
+      const text = await response.text()
+      if (text) {
+        try {
+          payload = JSON.parse(text)
+        } catch {
+          payload = null
+        }
+      }
+    } catch (error) {
+      if (attempt === GITHUB_REQUEST_MAX_ATTEMPTS) {
+        const reason = error?.name === 'AbortError' ? 'timed out' : 'could not be reached'
+        throw new GitHubUploadError(
+          `GitHub ${reason} after ${attempt} attempt(s): ${error?.message || error}`,
+          502,
+        )
+      }
+      await sleep(backoffMs(attempt))
+      continue
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (response.ok) {
+      return { response, payload }
+    }
+
+    if (isRetryableGitHubResponse(response, payload) && attempt < GITHUB_REQUEST_MAX_ATTEMPTS) {
+      await sleep(retryAfterMs(response, payload) ?? backoffMs(attempt))
+      continue
+    }
+
+    // A terminal answer (a real 4xx, or the last of the attempts): hand it back so `assertGitHubResponse`
+    // builds the message exactly as before.
+    return { response, payload }
+  }
+
+  // Unreachable: every path above returns or throws.
+  throw new GitHubUploadError('The GitHub request failed unexpectedly.', 502)
 }
 
 function assertGitHubResponse(action, { response, payload }) {
@@ -1019,3 +1115,523 @@ export async function uploadResults({
     batchCount: batches.length,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming upload sessions
+// ---------------------------------------------------------------------------
+//
+// The dashboard used to post every collected CSV of an experiment in one JSON body, base64-encoded.
+// That buffered the whole experiment (plus its base64 spelling and the enclosing JSON) in the browser
+// and again in the tunnel manager before a single commit was created, so a sweep of a few thousand
+// small files could pin hundreds of megabytes on the manager's single thread and stall `/status` with
+// it. A session removes that peak: the dashboard opens one session per results source, posts each CSV
+// as its raw bytes (one request per file), and the server keeps only the pending tree and commits it -
+// one commit per results source - once the files are in, or in bounded parts when the source is large.
+//
+// A session lives in this module (a plain Map) because the tunnel manager is a single process. It is
+// pruned after UPLOAD_SESSION_TTL_MS of inactivity, so an upload the browser abandons (tab closed,
+// navigation away) cannot pin memory forever.
+
+// How long an idle session is kept before the janitor drops it. A sweep posts thousands of small files
+// and each of them refreshes the timer, so this only ever expires a session the browser gave up on.
+export const UPLOAD_SESSION_TTL_MS = 10 * 60 * 1000
+// Inline files pending in a session are flushed into a commit once they reach this many bytes, which
+// keeps the tree request (and so the manager's heap) bounded no matter how many files one experiment
+// holds. Files larger than MAX_INLINE_UPLOAD_FILE_BYTES travel through a Git blob and only add a SHA to
+// the pending tree, so they do not count against this budget.
+export const UPLOAD_SESSION_FLUSH_BYTES = 4 * 1024 * 1024
+
+const uploadSessions = new Map()
+
+function sessionInlineEntryBytes(treePath, content) {
+  return Buffer.byteLength(
+    JSON.stringify({ path: treePath, mode: '100644', type: 'blob', content }),
+    'utf8',
+  )
+}
+
+// Drops sessions the browser abandoned. Returns how many were removed so the caller can log it.
+export function pruneUploadSessions(now = Date.now()) {
+  let removed = 0
+  for (const [id, session] of uploadSessions) {
+    if (now - session.lastActivityAt > UPLOAD_SESSION_TTL_MS) {
+      uploadSessions.delete(id)
+      removed += 1
+    }
+  }
+  return removed
+}
+
+export function getUploadSessionCount() {
+  return uploadSessions.size
+}
+
+async function readBranchBase(session, request) {
+  const { repo, branch } = session.config
+  const requestOptions = { fetchImpl: request, config: session.config }
+  const refResult = await githubRequest({
+    ...requestOptions,
+    pathname: `/repos/${repo}/git/ref/heads/${branch}`,
+  })
+
+  let baseCommitSha = null
+  let baseTreeSha = null
+
+  if (refResult.response.ok) {
+    baseCommitSha = refResult.payload?.object?.sha || null
+    if (baseCommitSha) {
+      const commitResult = await githubRequest({
+        ...requestOptions,
+        pathname: `/repos/${repo}/git/commits/${baseCommitSha}`,
+      })
+      assertGitHubResponse(`read the ${branch} branch tip`, commitResult)
+      baseTreeSha = commitResult.payload?.tree?.sha || null
+    }
+  } else if (refResult.response.status !== 404 && refResult.response.status !== 409) {
+    assertGitHubResponse(`read the ${branch} branch`, refResult)
+  }
+
+  return { baseCommitSha, baseTreeSha }
+}
+
+async function readExistingPaths(session, request) {
+  if (!session.baseTreeSha) {
+    return null
+  }
+
+  const { repo } = session.config
+  const treeResult = await githubRequest({
+    fetchImpl: request,
+    config: session.config,
+    pathname: `/repos/${repo}/git/trees/${session.baseTreeSha}?recursive=1`,
+  })
+  assertGitHubResponse('read the existing results tree', treeResult)
+  if (treeResult.payload?.truncated) {
+    throw new GitHubUploadError(
+      'GitHub returned a truncated repository tree, so update upload cannot safely check every result file.',
+      502,
+    )
+  }
+
+  return new Set(
+    (treeResult.payload?.tree || [])
+      .filter((entry) => entry?.type === 'blob')
+      .map((entry) => entry.path),
+  )
+}
+
+
+// Opens the session an experiment's files stream into. `experimentFolder` is the results source the
+// files were read from and becomes the experiment level of the tree, exactly as in `uploadResults`.
+export async function createUploadSession({
+  config,
+  folder,
+  experimentFolder,
+  uploadMode = 'full',
+  commitMessage = '',
+  fetchImpl,
+} = {}) {
+  if (!isGitHubConfigured(config)) {
+    throw new GitHubUploadError(
+      'GitHub upload is not configured. Set GITHUB_TOKEN and GITHUB_REPO in .env and restart the tunnel manager.',
+      409,
+    )
+  }
+
+  if (!folder) {
+    throw new GitHubUploadError('An upload folder name is required.', 400)
+  }
+
+  const experiment = sanitizeSegment(experimentFolder, '')
+  if (!experiment) {
+    throw new GitHubUploadError(
+      'An upload session requires the experiment (results source) its files belong to.',
+      400,
+    )
+  }
+
+  if (experiment === UNNAMED_EXPERIMENT_SOURCE) {
+    throw new GitHubUploadError(
+      `The ongoing "${UNNAMED_EXPERIMENT_SOURCE}" results source has no experiment name yet, so its sub-experiments cannot be uploaded. Upload the Experiment_* archive the run becomes once it ends.`,
+      400,
+    )
+  }
+
+  const request = fetchImpl || globalThis.fetch
+  if (typeof request !== 'function') {
+    throw new GitHubUploadError('No fetch implementation is available in this Node runtime.', 500)
+  }
+
+  pruneUploadSessions()
+
+  const mode = normalizeUploadMode(uploadMode)
+  const session = {
+    id: randomUUID(),
+    config,
+    folder,
+    folderPath: buildResultsTreePath(config, folder),
+    caps: resolveTreeCaps(config?.resultsPath, folder),
+    experimentFolder: experiment,
+    mode,
+    commitMessage,
+    baseCommitSha: null,
+    baseTreeSha: null,
+    existingPaths: null,
+    pending: [],
+    pendingBytes: 0,
+    totalBytes: 0,
+    fileCount: 0,
+    skippedCount: 0,
+    commitCount: 0,
+    latestCommitSha: null,
+    latestTreeSha: null,
+    trimmedByExperiment: new Map(),
+    rawByTreePath: new Map(),
+    shortened: new Map(),
+    shortenedCount: 0,
+    createdAt: Date.now(),
+    lastActivityAt: Date.now(),
+  }
+
+  if (mode === 'update') {
+    const base = await readBranchBase(session, request)
+    session.baseCommitSha = base.baseCommitSha
+    session.baseTreeSha = base.baseTreeSha
+    session.existingPaths = await readExistingPaths(session, request)
+  }
+
+  uploadSessions.set(session.id, session)
+  return session
+}
+
+function findUploadSession(id) {
+  const session = uploadSessions.get(String(id ?? ''))
+  if (!session) {
+    throw new GitHubUploadError(
+      'This upload session has expired or was never created. Start the upload again.',
+      404,
+    )
+  }
+  return session
+}
+
+// Adds one CSV (raw bytes, already the file itself) to the session. The path is validated and trimmed
+// exactly as `uploadResults` does it, so a session produces the same tree a one-shot upload would.
+export async function addUploadSessionFile({ id, relativePath, content, fetchImpl } = {}) {
+  const session = findUploadSession(id)
+  session.lastActivityAt = Date.now()
+
+  const request = fetchImpl || globalThis.fetch
+  const requestOptions = { fetchImpl: request, config: session.config }
+  const { repo } = session.config
+
+  const normalized = normalizeResultRelativePath(relativePath)
+  if (!normalized) {
+    throw new GitHubUploadError(
+      `Invalid results path "${String(relativePath ?? '')}". Expected "<sub-experiment>/<iteration>/results.csv" or "<sub-experiment>/<iteration>/results_from_json.csv".`,
+      400,
+    )
+  }
+
+  const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content ?? '')
+  const bytes = buffer.length
+  if (bytes === 0) {
+    throw new GitHubUploadError(`"${normalized}" is empty.`, 400)
+  }
+  if (bytes > MAX_UPLOAD_FILE_BYTES) {
+    throw new GitHubUploadError(
+      `"${normalized}" is larger than GitHub's ${Math.round(MAX_UPLOAD_FILE_BYTES / (1024 * 1024))} MiB per-file limit.`,
+      413,
+    )
+  }
+
+  const text = buffer.toString('utf8')
+  // A results.csv is UTF-8 text: a payload whose bytes cannot be spelled as UTF-8 is refused instead of
+  // being committed with replacement characters in place of its original content.
+  if (!Buffer.from(text, 'utf8').equals(buffer)) {
+    throw new GitHubUploadError(
+      `"${normalized}" is not UTF-8 text, so it cannot be committed as a results.csv.`,
+      400,
+    )
+  }
+
+  const experimentFolder = shortenTrailingTimestampSegment(
+    session.experimentFolder,
+    session.caps.experiment,
+  )
+  const shortenedPath = shortenResultRelativePath(
+    normalized,
+    session.caps.subExperiment,
+    session.caps.iteration,
+  )
+  const treePath = buildResultsTreePath(session.config, session.folder, experimentFolder, shortenedPath)
+
+  // Two different archive names must never end up in one folder: their results would merge and the
+  // experiment level would stop identifying the run. The digest makes a collision implausible, so
+  // failing loudly is enough.
+  const knownRaw = session.trimmedByExperiment.get(experimentFolder)
+  if (knownRaw !== undefined && knownRaw !== session.experimentFolder) {
+    throw new GitHubUploadError(
+      `The experiment names "${knownRaw}" and "${session.experimentFolder}" are both too long for git and shorten to "${experimentFolder}", which would merge them into one folder. Rename one of the results sources and upload it again.`,
+      400,
+    )
+  }
+  session.trimmedByExperiment.set(experimentFolder, session.experimentFolder)
+
+  const knownPath = session.rawByTreePath.get(treePath)
+  if (knownPath !== undefined && knownPath !== normalized) {
+    throw new GitHubUploadError(
+      `The sub-experiment names "${knownPath}" and "${normalized}" are both too long for git and shorten to the same path "${treePath}". Rename one of them and upload it again.`,
+      400,
+    )
+  }
+  session.rawByTreePath.set(treePath, normalized)
+
+  if (treePath.length > MAX_TREE_PATH_LENGTH) {
+    throw new GitHubUploadError(
+      `The upload path "${treePath}" is longer than the ${MAX_TREE_PATH_LENGTH} characters git can check out reliably. Rename the sub-experiment it belongs to and upload it again.`,
+      400,
+    )
+  }
+
+  for (const [level, from, to] of [
+    ['experiment', session.experimentFolder, experimentFolder],
+    ['path', normalized, shortenedPath],
+  ]) {
+    if (from === to || session.shortened.has(`${level}:${from}`)) {
+      continue
+    }
+
+    session.shortened.set(`${level}:${from}`, describeTrimmedName(level, from, to))
+    session.shortenedCount += 1
+  }
+
+  // Update mode: an iteration whose two files are both already in the repository is left alone, so a
+  // re-run of the upload only commits what is new. `full` mode commits every file it is handed.
+  if (session.mode === 'update' && session.existingPaths) {
+    const slash = treePath.lastIndexOf('/')
+    const fileName = treePath.slice(slash + 1)
+    const iterationPath = treePath.slice(0, slash)
+    if (
+      RESULTS_FILE_NAMES.has(fileName) &&
+      session.existingPaths.has(treePath) &&
+      session.existingPaths.has(`${iterationPath}/results.csv`) &&
+      session.existingPaths.has(`${iterationPath}/results_from_json.csv`)
+    ) {
+      session.fileCount += 1
+      session.skippedCount += 1
+      return { ok: true, treePath, bytes, skipped: true }
+    }
+  }
+
+  // A client that resends a file after a timeout (or a replayed request) must not add the same tree path
+  // twice: the previous pending entry is replaced in place, so a tree request never carries two entries
+  // for one path and the byte/file counters stay exact.
+  const duplicateIndex = session.pending.findIndex((entry) => entry.treePath === treePath)
+  if (duplicateIndex !== -1) {
+    const previous = session.pending[duplicateIndex]
+    if (previous.content !== undefined) {
+      session.pendingBytes -= sessionInlineEntryBytes(treePath, previous.content)
+    }
+    session.pending.splice(duplicateIndex, 1)
+    session.fileCount -= 1
+    session.totalBytes -= Number(previous.bytes) || 0
+  }
+
+  session.fileCount += 1
+  session.totalBytes += bytes
+
+  const inlineBytes = sessionInlineEntryBytes(treePath, text)
+  const useBlob =
+    bytes > MAX_INLINE_UPLOAD_FILE_BYTES || inlineBytes > MAX_UPLOAD_TREE_PAYLOAD_BYTES - 256
+
+  let entry
+  if (useBlob) {
+    const blobResult = await githubRequest({
+      ...requestOptions,
+      pathname: `/repos/${repo}/git/blobs`,
+      method: 'POST',
+      body: { content: buffer.toString('base64'), encoding: 'base64' },
+    })
+    assertGitHubResponse(`create the blob for ${treePath}`, blobResult)
+    const blobSha = blobResult.payload?.sha || null
+    if (!blobSha) {
+      throw new GitHubUploadError(`GitHub did not return a blob for ${treePath}.`, 502)
+    }
+    entry = { treePath, sha: blobSha, bytes }
+  } else {
+    entry = { treePath, content: text, bytes }
+  }
+
+  // Commit what is pending before an inline entry that would not fit alongside it, so every tree
+  // request stays inside the payload budget however the files are sized.
+  if (
+    entry.content !== undefined &&
+    session.pendingBytes + inlineBytes > MAX_UPLOAD_TREE_PAYLOAD_BYTES - 256
+  ) {
+    await flushUploadSession(session, request)
+  }
+
+  session.pending.push(entry)
+  if (entry.content !== undefined) {
+    session.pendingBytes += inlineBytes
+  }
+
+  if (
+    session.pendingBytes >= UPLOAD_SESSION_FLUSH_BYTES ||
+    session.pending.length >= MAX_UPLOAD_FILES
+  ) {
+    await flushUploadSession(session, request)
+  }
+
+  return { ok: true, treePath, bytes, skipped: false }
+}
+
+// Commits the pending files of a session as one tree (one GitHub commit), building on the current
+// branch tip. Called automatically once the pending tree grows past the flush budget and once more at
+// the end of the experiment, where a tree identical to the branch tip creates no commit.
+async function flushUploadSession(session, request) {
+  if (session.pending.length === 0) {
+    return session
+  }
+
+  const { repo, branch } = session.config
+  const requestOptions = { fetchImpl: request, config: session.config }
+
+  const base = await readBranchBase(session, request)
+  session.baseCommitSha = base.baseCommitSha
+  session.baseTreeSha = base.baseTreeSha
+
+  const treeBody = { tree: [] }
+  for (const entry of session.pending) {
+    const treeEntry = { path: entry.treePath, mode: '100644', type: 'blob' }
+    if (entry.sha) {
+      treeEntry.sha = entry.sha
+    } else {
+      treeEntry.content = entry.content
+    }
+    treeBody.tree.push(treeEntry)
+  }
+  if (session.baseTreeSha) {
+    treeBody.base_tree = session.baseTreeSha
+  }
+
+  const treeResult = await githubRequest({
+    ...requestOptions,
+    pathname: `/repos/${repo}/git/trees`,
+    method: 'POST',
+    body: treeBody,
+  })
+  assertGitHubResponse('create the upload tree', treeResult)
+
+  const treeSha = treeResult.payload?.sha || null
+  if (!treeSha) {
+    throw new GitHubUploadError('GitHub did not return a tree for the upload.', 502)
+  }
+  session.latestTreeSha = treeSha
+
+  // The pending files were already in the branch tip, so the tree is unchanged and no commit is made.
+  if (session.baseTreeSha && treeSha === session.baseTreeSha) {
+    session.pending = []
+    session.pendingBytes = 0
+    return session
+  }
+
+
+  const partSuffix = session.commitCount > 0 ? ` (part ${session.commitCount + 1})` : ''
+  const commitResult = await githubRequest({
+    ...requestOptions,
+    pathname: `/repos/${repo}/git/commits`,
+    method: 'POST',
+    body: {
+      message: `${buildCommitMessage(session.commitMessage, session.folder)}${partSuffix}`,
+      tree: treeSha,
+      parents: session.baseCommitSha ? [session.baseCommitSha] : [],
+    },
+  })
+  assertGitHubResponse('create the upload commit', commitResult)
+
+  const commitSha = commitResult.payload?.sha || null
+  if (!commitSha) {
+    throw new GitHubUploadError('GitHub did not return a commit for the upload.', 502)
+  }
+
+  if (session.baseCommitSha) {
+    const updateResult = await githubRequest({
+      ...requestOptions,
+      pathname: `/repos/${repo}/git/refs/heads/${branch}`,
+      method: 'PATCH',
+      body: { sha: commitSha, force: false },
+    })
+    assertGitHubResponse(`update the ${branch} branch`, updateResult)
+  } else {
+    const createResult = await githubRequest({
+      ...requestOptions,
+      pathname: `/repos/${repo}/git/refs`,
+      method: 'POST',
+      body: { ref: `refs/heads/${branch}`, sha: commitSha },
+    })
+    assertGitHubResponse(`create the ${branch} branch`, createResult)
+  }
+
+  session.baseCommitSha = commitSha
+  session.baseTreeSha = treeSha
+  session.latestCommitSha = commitSha
+  session.commitCount += 1
+  session.pending = []
+  session.pendingBytes = 0
+
+  return session
+}
+
+function buildUploadSessionSummary(session) {
+  const webUrl = `${buildWebBaseUrl(session.config)}/${session.config.repo}`
+  const committed = Math.max(0, session.fileCount - session.skippedCount)
+
+  return {
+    ok: true,
+    repo: session.config.repo,
+    branch: session.config.branch,
+    folder: session.folder,
+    folderPath: session.folderPath,
+    experimentFolders: [session.experimentFolder],
+    fileCount: committed,
+    skippedFileCount: session.skippedCount,
+    totalBytes: session.totalBytes,
+    resultsPath: session.config.resultsPath,
+    // Kept short on purpose, like `uploadResults`: how many names were trimmed plus a few examples.
+    trimmed: {
+      count: session.shortenedCount,
+      examples: [...session.shortened.values()].slice(0, 10),
+    },
+    uploadMode: session.mode,
+    webUrl,
+    unchanged: session.commitCount === 0,
+    commitCount: session.commitCount,
+    commitSha: session.latestCommitSha || null,
+    commitUrl: session.latestCommitSha ? `${webUrl}/commit/${session.latestCommitSha}` : '',
+    treeSha: session.latestTreeSha,
+    batchCount: session.commitCount,
+  }
+}
+
+// Commits whatever is still pending and closes the session. The summary matches the one `uploadResults`
+// returns, so the dashboard folds session results together exactly as it did before.
+export async function commitUploadSession({ id, fetchImpl } = {}) {
+  const session = findUploadSession(id)
+  const request = fetchImpl || globalThis.fetch
+
+  try {
+    await flushUploadSession(session, request)
+    return buildUploadSessionSummary(session)
+  } finally {
+    session.lastActivityAt = Date.now()
+    uploadSessions.delete(session.id)
+  }
+}
+
+// Drops a session without committing it, for a sweep that failed part-way through.
+export function abortUploadSession({ id } = {}) {
+  return uploadSessions.delete(String(id ?? ''))
+}
+

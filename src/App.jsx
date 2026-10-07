@@ -8,6 +8,8 @@ import {
   CartesianGrid,
   XAxis,
   YAxis,
+  Legend,
+  Tooltip,
 } from 'recharts'
 import JSZip from 'jszip'
 import { saveAs } from 'file-saver'
@@ -67,6 +69,16 @@ const EXPERIMENT_TYPE_KEYS = [
 ]
 const DEFAULT_RESULTS_SCOPE = 'current'
 const DEFAULT_EXPERIMENT_TYPE = 'MST'
+const WORKLOAD_PROFILE_COLORS = [
+  '#1f5fff',
+  '#f68026',
+  '#0b9254',
+  '#a855f7',
+  '#d92d20',
+  '#0891b2',
+  '#ca8a04',
+  '#db2777',
+]
 
 function parsePortToken(token) {
   const numeric = Number(String(token || '').trim())
@@ -133,6 +145,178 @@ function parseBoolean(value) {
 
   const normalized = String(value).trim().toLowerCase()
   return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'pass'
+}
+
+function parseCsv(text) {
+    const rows = []
+    let row = []
+    let value = ''
+    let quoted = false
+
+    for (let index = 0; index < text.length; index += 1) {
+      const character = text[index]
+      const next = text[index + 1]
+
+      if (character === '"' && quoted && next === '"') {
+        value += '"'
+        index += 1
+      } else if (character === '"') {
+        quoted = !quoted
+      } else if (character === ',' && !quoted) {
+        row.push(value)
+        value = ''
+      } else if ((character === '\n' || character === '\r') && !quoted) {
+        if (character === '\r' && next === '\n') {
+          index += 1
+        }
+        row.push(value)
+        if (row.some((cell) => cell !== '')) {
+          rows.push(row)
+        }
+        row = []
+        value = ''
+      } else {
+        value += character
+      }
+    }
+
+    if (value || row.length > 0) {
+      row.push(value)
+      if (row.some((cell) => cell !== '')) {
+        rows.push(row)
+      }
+    }
+
+    if (rows.length < 2) {
+      return []
+    }
+
+    const headers = rows[0]
+    return rows.slice(1).map((cells) =>
+      Object.fromEntries(headers.map((header, index) => [header, cells[index] ?? ''])),
+    )
+}
+
+const REQUEST_START_KEYS = [
+  'request_sent_at_utc',
+  'request_start_time',
+  'request_started_at',
+  'start_time',
+  'started_at',
+]
+const REQUEST_END_KEYS = [
+  'full_response_received_at_utc',
+  'request_end_time',
+  'request_finished_at',
+  'end_time',
+  'finished_at',
+  'completed_at',
+]
+const REQUEST_RECEIVED_KEYS = ['received_timestamp', 'received_at', 'response_received_at']
+const REQUEST_DURATION_KEYS = ['request_duration_ms', 'complete_response_time', 'duration_ms']
+const WORKLOAD_PROFILE_KEYS = ['workload_profile', 'profile', 'workloadProfile']
+
+function parseRequestTimestamp(value) {
+  if (value === null || value === undefined || String(value).trim() === '') {
+    return null
+  }
+
+  const text = String(value).trim()
+  const numeric = Number(text)
+  if (Number.isFinite(numeric)) {
+    const absolute = Math.abs(numeric)
+    const milliseconds =
+      absolute >= 1e17
+        ? numeric / 1e6
+        : absolute >= 1e14
+          ? numeric / 1e3
+          : absolute < 1e11
+            ? numeric * 1e3
+            : numeric
+    return Number.isFinite(milliseconds) ? milliseconds : null
+  }
+
+  const compactTimestamp = text.match(
+    /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(?:\.(\d+))?$/,
+  )
+  if (compactTimestamp) {
+    const [, year, month, day, hour, minute, second, fraction = ''] = compactTimestamp
+    const milliseconds = Number(`0.${fraction}`) * 1000
+    return Date.UTC(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute),
+      Number(second),
+      milliseconds,
+    )
+  }
+
+  const parsed = Date.parse(text)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function buildRequestTimeline(rows) {
+  const events = []
+  const profiles = new Set()
+  let origin = null
+
+  rows.forEach((row) => {
+    let start = parseRequestTimestamp(getFieldValue(row, REQUEST_START_KEYS))
+    let end = parseRequestTimestamp(getFieldValue(row, REQUEST_END_KEYS))
+
+    // Older results_from_json.csv files contain the completion timestamp and
+    // total response time instead of explicit request start/end timestamps.
+    if (start === null || end === null) {
+      const received = parseRequestTimestamp(getFieldValue(row, REQUEST_RECEIVED_KEYS))
+      const duration = parseNumber(getFieldValue(row, REQUEST_DURATION_KEYS))
+      if (received !== null && duration !== null && duration >= 0) {
+        start = received - duration
+        end = received
+      }
+    }
+
+    if (start === null || end === null || end < start) {
+      return
+    }
+
+    const profile = getFieldValue(row, WORKLOAD_PROFILE_KEYS) || 'Unknown profile'
+    profiles.add(profile)
+    origin = origin === null ? start : Math.min(origin, start)
+    events.push({ timestamp: start, profile, delta: 1, order: 1 })
+    events.push({ timestamp: end, profile, delta: -1, order: 0 })
+  })
+
+  if (events.length === 0 || origin === null) {
+    return { data: [], profiles: [] }
+  }
+
+  events.sort((a, b) => a.timestamp - b.timestamp || a.order - b.order)
+  const counts = Object.fromEntries([...profiles].map((profile) => [profile, 0]))
+  const data = [{ time: 0, total: 0, displayTime: new Date(origin).toISOString() }]
+
+  let index = 0
+  while (index < events.length) {
+    const timestamp = events[index].timestamp
+    while (index < events.length && events[index].timestamp === timestamp) {
+      const event = events[index]
+      counts[event.profile] += event.delta
+      index += 1
+    }
+
+    data.push({
+      time: (timestamp - origin) / 1000,
+      total: Object.values(counts).reduce((sum, count) => sum + count, 0),
+      displayTime: new Date(timestamp).toISOString(),
+      ...counts,
+    })
+  }
+
+  return {
+    data,
+    profiles: [...profiles].sort((a, b) => a.localeCompare(b)),
+  }
 }
 
 function sortIterationsChronologically(iterations) {
@@ -299,6 +483,72 @@ function buildTunnelUrl(pathname) {
   }
 
   return `${baseUrl}${normalizedPath}`
+}
+
+// Deadlines that keep one stalled hop (an SSH tunnel hiccup, a hung GitHub call, an API that never
+// answers) from freezing the whole sweep: without them a single pending `await` leaves the upload bar
+// stuck at its last percentage and the busy state uncleared forever. Finite per request, and generous
+// for the long steps (a batch conversion, a big experiment's commit).
+const UPLOAD_REQUEST_TIMEOUT_MS = 120000
+const UPLOAD_LONG_REQUEST_TIMEOUT_MS = 600000
+
+// `fetch` with an AbortController deadline. Every upload-related request goes through it so a hop that
+// never answers surfaces as a retryable timeout instead of an unending wait.
+async function fetchWithTimeout(url, options = {}, timeoutMs = UPLOAD_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...options, signal: controller.signal })
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      const timeoutError = new Error(
+        `The request timed out after ${Math.round(timeoutMs / 1000)}s: the tunnel or the server did not answer.`,
+      )
+      timeoutError.name = 'UploadTimeoutError'
+      timeoutError.code = 'UPLOAD_TIMEOUT'
+      throw timeoutError
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// An HTTP failure that carries its status code, so the retryer can tell a transient 5xx from a 4xx that
+// is a real answer (expired session, missing file) and must be surfaced immediately.
+function uploadHttpError(message, status) {
+  const error = new Error(message)
+  error.status = Number(status)
+  return error
+}
+
+function isRetryableUploadError(error) {
+  if (!error) {
+    return false
+  }
+  if (error.code === 'UPLOAD_TIMEOUT') {
+    return true
+  }
+  const status = Number(error.status)
+  return Number.isInteger(status) && status >= 500
+}
+
+// Retries a request a few times with linear backoff. Only transient failures (a timeout or a 5xx) are
+// retried; a 4xx is returned at once, so a real client error is never hidden behind repeated attempts.
+async function withUploadRetry(run, { attempts = 3, baseDelayMs = 750 } = {}) {
+  let lastError
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await run(attempt)
+    } catch (error) {
+      lastError = error
+      if (!isRetryableUploadError(error) || attempt === attempts) {
+        throw error
+      }
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt))
+    }
+  }
+  throw lastError
 }
 
 function parseExperimentPair(experimentName) {
@@ -816,8 +1066,13 @@ function getTextColorForBackground(bg) {
   return contrastWithWhite >= contrastWithBlack ? '#ffffff' : '#000000'
 }
 
-async function fetchJson(pathname, port, queryParams = {}) {
-  const response = await fetch(buildApiUrl(pathname, port, queryParams))
+// Reads a JSON endpoint. A deadline keeps a stalled hop (a tunnel hiccup, a server that never answers)
+// from pinning a poller or a panel load forever; on timeout the promise rejects with a clear error, which
+// the callers already turn into an `Unavailable`/`offline` state.
+const FETCH_JSON_TIMEOUT_MS = 20000
+
+async function fetchJson(pathname, port, queryParams = {}, timeoutMs = FETCH_JSON_TIMEOUT_MS) {
+  const response = await fetchWithTimeout(buildApiUrl(pathname, port, queryParams), {}, timeoutMs)
   if (!response.ok) {
     throw new Error(`Request failed (${response.status}) for ${pathname}`)
   }
@@ -1093,11 +1348,12 @@ function blobToBase64(blob) {
   })
 }
 
-// The GitHub upload sends exactly the folder-style tree the ZIP download builds, so both paths share
-// this collector: one `<sub-experiment>/<iteration>/<file>` entry per available file, base64-encoded
-// because it travels inside a JSON body. Every entry also carries the experiment (results source) it
-// was read from, because that is the folder level the upload names after the experiment; the ZIP
-// download ignores the field and keeps using `path` alone.
+// Collector for the ZIP download: it builds one `<sub-experiment>/<iteration>/<file>` entry per
+// available file, base64-encoded because a ZIP entry is written from a string. Every entry also carries
+// the experiment (results source) it was read from, which the ZIP download ignores and keeps using
+// `path` alone. The GitHub upload no longer shares this collector: it streams each CSV to the tunnel
+// manager as raw bytes (`streamExperimentResultsToUploadSession`), so nothing here is base64-encoded for
+// the upload, and only one file is ever held at a time.
 async function collectExperimentResultFiles(
   experiment,
   port,
@@ -1117,34 +1373,172 @@ async function collectExperimentResultFiles(
   const experimentFolder = buildUploadExperimentFolder(resultsScope)
 
   for (const iterationName of iterations) {
+    // The two files for an iteration are independent. Fetching them together avoids making the
+    // derived results_from_json.csv conversion wait behind results.csv, while Promise.all keeps
+    // memory bounded to one iteration instead of collecting an entire port at once.
+    const iterationFiles = await Promise.all(
+      fileNames.map(async (fileName) => {
+        onProgress?.({
+          experiment: experimentFolder,
+          subExperiment: experiment,
+        })
+        const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/${fileName}`
+        const response = await fetch(buildApiUrl(endpoint, port, { resultsScope }))
+        if (!response.ok) {
+          onProgress?.({ completed: 1 })
+          return null
+        }
+
+        const contentBase64 = await blobToBase64(await response.blob())
+        if (!contentBase64) {
+          onProgress?.({ completed: 1 })
+          return null
+        }
+
+        onProgress?.({ ready: 1, completed: 1 })
+        return {
+          path: `${experiment}/${iterationName}/${fileName}`,
+          experimentFolder,
+          contentBase64,
+        }
+      }),
+    )
+
+    files.push(...iterationFiles.filter(Boolean))
+  }
+
+  return files
+}
+
+// Coalesces progress notifications so a sweep of thousands of files repaints a few hundred times
+// instead of once per file. The caller keeps its counters exact and passes the current absolute
+// snapshot every time; only the state setter (and therefore the re-render) is rate limited, with a
+// trailing flush so a final value is never dropped. `cancel` stops a pending flush when the value
+// is about to be replaced explicitly.
+function createThrottledProgress(apply, minIntervalMs = 150) {
+  let pending = null
+  let lastRun = 0
+  let timer = null
+
+  const flush = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+    lastRun = Date.now()
+    const next = pending
+    pending = null
+    if (next) {
+      apply(next)
+    }
+  }
+
+  const report = (payload) => {
+    pending = payload
+    if (timer) {
+      return
+    }
+    const elapsed = Date.now() - lastRun
+    if (elapsed >= minIntervalMs) {
+      flush()
+      return
+    }
+    timer = setTimeout(flush, minIntervalMs - elapsed)
+  }
+
+  report.flush = flush
+  report.cancel = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+    pending = null
+  }
+
+  return report
+}
+
+// Asks the API to prepare every derived results_from_json.csv an experiment is missing in one
+// server pass, before the upload streams them. Best-effort: an API without the endpoint (or a
+// failed pass) still lets each file convert on demand during its download, only slowly.
+async function ensureExperimentResultsFromJson(experiment, port, resultsScope) {
+  try {
+    const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/ensure-results-from-json`
+    return await withUploadRetry(async () => {
+      const response = await fetchWithTimeout(
+        buildApiUrl(endpoint, port, { resultsScope }),
+        { method: 'POST' },
+        UPLOAD_LONG_REQUEST_TIMEOUT_MS,
+      )
+      if (response.ok) {
+        return await response.json()
+      }
+      throw uploadHttpError(`Results preparation failed (HTTP ${response.status}).`, response.status)
+    })
+  } catch {
+    // Best-effort: per-file downloads still convert on demand if this pass fails or times out.
+    return null
+  }
+}
+
+// Streams an experiment's result CSVs to an open upload session, one file at a time: each blob is
+// posted as raw bytes as soon as it is fetched and then dropped, so only a single file (never the
+// whole experiment, never its base64 spelling) is held in the browser at any moment. `onProgress`
+// mirrors the batched collector so the progress bar keeps its meaning.
+async function streamExperimentResultsToUploadSession({
+  sessionId,
+  experiment,
+  port,
+  resultsScope,
+  experimentFolder,
+  iterationNames,
+  fileNames = ['results.csv', 'results_from_json.csv'],
+  onProgress,
+}) {
+  const iterations = iterationNames || (
+    await fetchJson(
+      `/api/experiments/${encodeURIComponent(experiment)}/iterations`,
+      port,
+      { resultsScope },
+    )
+  ).iterations || []
+
+  let fileCount = 0
+
+  for (const iterationName of iterations) {
+    // Sequential on purpose: the two files of an iteration are independent, but posting them one after
+    // the other (instead of fetching both blobs together) is what keeps the browser's peak at one file.
     for (const fileName of fileNames) {
       onProgress?.({
         experiment: experimentFolder,
         subExperiment: experiment,
       })
+
       const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/${fileName}`
-      const response = await fetch(buildApiUrl(endpoint, port, { resultsScope }))
-      if (!response.ok) {
+      const blob = await withUploadRetry(async () => {
+        const response = await fetchWithTimeout(buildApiUrl(endpoint, port, { resultsScope }))
+        if (!response.ok) {
+          throw uploadHttpError(
+            `The file ${fileName} could not be downloaded (HTTP ${response.status}).`,
+            response.status,
+          )
+        }
+        return response.blob()
+      }).catch(() => null)
+
+      if (!blob) {
+        // A missing file (or a download that keeps failing) is skipped; the rest of the sweep goes on.
         onProgress?.({ completed: 1 })
         continue
       }
 
-      const contentBase64 = await blobToBase64(await response.blob())
-      if (!contentBase64) {
-        onProgress?.({ completed: 1 })
-        continue
-      }
-
-      files.push({
-        path: `${experiment}/${iterationName}/${fileName}`,
-        experimentFolder,
-        contentBase64,
-      })
+      await uploadGitHubSessionFile(sessionId, `${experiment}/${iterationName}/${fileName}`, blob)
+      fileCount += 1
       onProgress?.({ ready: 1, completed: 1 })
     }
   }
 
-  return files
+  return { fileCount }
 }
 
 // Everything the port currently exposes (interval pairs and additive `mix_...` folders), split by the
@@ -1235,42 +1629,6 @@ function buildUploadCommitMessage({ model, experimentCount, fileCount, sourceLab
   return `Add ${experimentCount} ${experimentLabel} from ${model}: ${fileCount} result CSV file(s) via MoST-dashboard${scope}`
 }
 
-// Keep request bodies below the tunnel manager's 256 MiB limit. The margin accounts for differences
-// between the browser's serialized request and the server's streamed byte count.
-const MAX_GITHUB_UPLOAD_REQUEST_BYTES = 240 * 1024 * 1024
-const uploadTextEncoder = new TextEncoder()
-
-function serializedUploadSize({ model, node, gpuCount, commitMessage, files }) {
-  return uploadTextEncoder.encode(JSON.stringify({ model, node, gpuCount, commitMessage, files })).length
-}
-
-function splitGitHubUploadFiles({ model, node, gpuCount, commitMessage, files }) {
-  const batches = []
-  let batch = []
-
-  const addBatch = () => {
-    if (batch.length > 0) {
-      batches.push(batch)
-      batch = []
-    }
-  }
-
-  for (const file of files) {
-    const candidate = [...batch, file]
-    if (
-      batch.length > 0 &&
-      serializedUploadSize({ model, node, gpuCount, commitMessage, files: candidate }) >
-        MAX_GITHUB_UPLOAD_REQUEST_BYTES
-    ) {
-      addBatch()
-    }
-    batch.push(file)
-  }
-  addBatch()
-
-  return batches
-}
-
 async function fetchGitHubUploadStatus() {
   const response = await fetch(buildTunnelUrl('/github/status'))
   if (!response.ok) {
@@ -1280,14 +1638,83 @@ async function fetchGitHubUploadStatus() {
   return response.json()
 }
 
-// The commit is created by the tunnel manager, which is the only process that ever sees the GitHub
-// token (it lives in the server-side .env, never in this bundle).
-async function requestGitHubUpload({ model, node, gpuCount, files, commitMessage, uploadMode }) {
-  const response = await fetch(buildTunnelUrl('/github/upload'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, node, gpuCount, commitMessage, uploadMode, files }),
+// Opens the server-side upload session an experiment's files stream into. The commit is still created
+// by the tunnel manager (the only process that ever sees the GitHub token, which lives in the
+// server-side .env and never in this bundle), but now the browser only ever has to send one file.
+async function startGitHubUploadSession({
+  model,
+  node,
+  gpuCount,
+  uploadMode,
+  experimentFolder,
+  commitMessage,
+}) {
+  const response = await fetchWithTimeout(
+    buildTunnelUrl('/github/upload/session'),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, node, gpuCount, uploadMode, experimentFolder, commitMessage }),
+    },
+    UPLOAD_LONG_REQUEST_TIMEOUT_MS,
+  )
+
+  let payload = null
+  try {
+    payload = await response.json()
+  } catch {
+    payload = null
+  }
+
+  if (!response.ok || !payload?.sessionId) {
+    throw new Error(
+      payload?.error || `The GitHub upload session could not be opened (HTTP ${response.status}).`,
+    )
+  }
+
+  return payload
+}
+
+// Posts one result CSV as raw bytes. The server stores it in the session's pending tree and commits it
+// together with the rest of the experiment.
+async function uploadGitHubSessionFile(sessionId, filePath, blob) {
+  const query = `?path=${encodeURIComponent(filePath)}`
+  const url = buildTunnelUrl(`/github/upload/session/${encodeURIComponent(sessionId)}/file${query}`)
+
+  // Safe to retry: the manager replaces a pending entry with the same tree path, so replaying the file
+  // after a timeout cannot add it to a commit twice.
+  return withUploadRetry(async () => {
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: blob,
+    })
+
+    let payload = null
+    try {
+      payload = await response.json()
+    } catch {
+      payload = null
+    }
+
+    if (!response.ok) {
+      throw uploadHttpError(
+        payload?.error || `The results file ${filePath} could not be uploaded (HTTP ${response.status}).`,
+        response.status,
+      )
+    }
+
+    return payload || {}
   })
+}
+
+// Commits the session and returns the same summary `POST /github/upload` used to return.
+async function commitGitHubUploadSession(sessionId) {
+  const response = await fetchWithTimeout(
+    buildTunnelUrl(`/github/upload/session/${encodeURIComponent(sessionId)}/commit`),
+    { method: 'POST' },
+    UPLOAD_LONG_REQUEST_TIMEOUT_MS,
+  )
 
   let payload = null
   try {
@@ -1297,10 +1724,26 @@ async function requestGitHubUpload({ model, node, gpuCount, files, commitMessage
   }
 
   if (!response.ok) {
-    throw new Error(payload?.error || `The GitHub upload failed (HTTP ${response.status}).`)
+    throw uploadHttpError(
+      payload?.error || `The GitHub upload could not be committed (HTTP ${response.status}).`,
+      response.status,
+    )
   }
 
   return payload || {}
+}
+
+// Best-effort: a failed sweep drops its half-filled session instead of leaving it for the janitor.
+async function abortGitHubUploadSession(sessionId) {
+  try {
+    await fetchWithTimeout(
+      buildTunnelUrl(`/github/upload/session/${encodeURIComponent(sessionId)}/abort`),
+      { method: 'POST' },
+      UPLOAD_REQUEST_TIMEOUT_MS,
+    )
+  } catch {
+    // The server prunes an abandoned session after a timeout anyway.
+  }
 }
 
 function CustomNode({ cx, cy, payload, onHover, onHoverEnd, onSelect }) {
@@ -1418,6 +1861,9 @@ function App() {
   const [iterationData, setIterationData] = useState([])
   const [selectedIteration, setSelectedIteration] = useState('')
   const [selectedIterationRows, setSelectedIterationRows] = useState([])
+  const [requestTimeline, setRequestTimeline] = useState({ data: [], profiles: [] })
+  const [requestTimelineLoading, setRequestTimelineLoading] = useState(false)
+  const [showTotalRequests, setShowTotalRequests] = useState(false)
   const [hoveredSummary, setHoveredSummary] = useState(null)
   const [loadingIterations, setLoadingIterations] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
@@ -1464,10 +1910,17 @@ function App() {
 
   useEffect(() => {
     let isMounted = true
+    // Guards against overlapping polls: a slow (or stalled) `/status` must not stack timers on top of each
+    // other while an upload is running. The deadline keeps one unresponsive call from pinning the poller.
+    let statusInFlight = false
 
     async function refreshTunnelStatus() {
+      if (statusInFlight) {
+        return
+      }
+      statusInFlight = true
       try {
-        const response = await fetch(buildTunnelUrl('/status'))
+        const response = await fetchWithTimeout(buildTunnelUrl('/status'), {}, 15000)
         if (!response.ok) {
           throw new Error('Tunnel manager status failed.')
         }
@@ -1511,6 +1964,8 @@ function App() {
           tunnels: [],
           message: 'Tunnel manager is offline.',
         })
+      } finally {
+        statusInFlight = false
       }
     }
 
@@ -1769,6 +2224,49 @@ function App() {
 
     loadExperimentData()
   }, [selectedExperiment, activeApiPort, selectedResultsScope])
+
+  useEffect(() => {
+    if (!selectedExperiment || !selectedIteration) {
+      setRequestTimeline({ data: [], profiles: [] })
+      return undefined
+    }
+
+    let isCancelled = false
+
+    async function loadRequestTimeline() {
+      setRequestTimelineLoading(true)
+      try {
+        const endpoint = `/api/experiments/${encodeURIComponent(selectedExperiment)}/iterations/${encodeURIComponent(selectedIteration)}/download/results_from_json.csv`
+        const response = await fetch(
+          buildApiUrl(endpoint, activeApiPort, { resultsScope: selectedResultsScope }),
+        )
+        if (!response.ok) {
+          throw new Error(`Request timeline failed (${response.status}).`)
+        }
+
+        const timeline = buildRequestTimeline(parseCsv(await response.text()))
+        if (!isCancelled) {
+          setRequestTimeline(timeline)
+        }
+      } catch {
+        if (!isCancelled) {
+          setRequestTimeline({ data: [], profiles: [] })
+          setErrorMessage(
+            `Unable to load request timeline for ${selectedIteration} on port ${activeApiPort}.`,
+          )
+        }
+      } finally {
+        if (!isCancelled) {
+          setRequestTimelineLoading(false)
+        }
+      }
+    }
+
+    loadRequestTimeline()
+    return () => {
+      isCancelled = true
+    }
+  }, [selectedExperiment, selectedIteration, activeApiPort, selectedResultsScope])
 
   const selectedPoint = useMemo(
     () => iterationData.find((point) => point.iteration === selectedIteration) || null,
@@ -2095,9 +2593,9 @@ function App() {
     }
   }
 
-  // The ZIP download and the GitHub upload read the results the same way, so both go through
-  // `collectExperimentResultFiles`: a folder tree of `<sub-experiment>/<iteration>/<file>`. The ZIP
-  // keeps that tree (the experiment level is only added to the repository path by the upload).
+  // The ZIP download reads the results through `collectExperimentResultFiles`: a folder tree of
+  // `<sub-experiment>/<iteration>/<file>`. (The GitHub upload streams the same files to the tunnel
+  // manager instead, see `streamExperimentResultsToUploadSession`.)
   async function appendExperimentCsvToZip(experiment, zip, fileNames = ['results.csv']) {
     const files = await collectExperimentResultFiles(
       experiment,
@@ -2398,6 +2896,11 @@ function App() {
     setUploadNotice(null)
     setErrorMessage('')
 
+    // Rate-limits the progress re-renders: a sweep of thousands of files would otherwise set state
+    // twice per file. The counters below stay exact; only the render is coalesced, and `cancel` in
+    // the finally stops a trailing update from resurrecting the bar after it has been cleared.
+    const reportProgress = createThrottledProgress((payload) => setUploadProgress(payload))
+
     try {
       const target = await resolveUploadTarget(port, identity, entries)
       if (!target.ok) {
@@ -2438,97 +2941,164 @@ function App() {
         phase: 'collecting',
       })
 
-      for (const { entry, iterations } of collectionPlans) {
-        let experimentFiles
+      // Group the experiments by results source. Every sub-experiment of one archive shares its experiment
+      // folder, so a whole archive uploads through a single session and commits once: a sweep of N
+      // experiments becomes S commits (one per source) instead of N, which keeps a thousands-file upload
+      // well clear of GitHub's secondary rate limits. A source that fails is dropped and the rest of the
+      // sweep goes on, so one stall no longer freezes the whole upload.
+      const planGroups = new Map()
+      for (const plan of collectionPlans) {
+        const experimentFolder = buildUploadExperimentFolder(plan.entry.resultsScope)
+        if (!planGroups.has(experimentFolder)) {
+          planGroups.set(experimentFolder, [])
+        }
+        planGroups.get(experimentFolder).push(plan)
+      }
+
+      let failedSourceCount = 0
+      let lastUploadError = ''
+
+      for (const [experimentFolder, groupPlans] of planGroups) {
+        // Prepare the derived per-request CSV of every iteration in one server pass before opening the
+        // session. The upload streams that file for each iteration, and deriving it lazily (one Python
+        // process per file, interleaved with the upload) is what used to stall a large sweep partway
+        // through. Best-effort: per-file downloads still convert on demand.
+        for (const plan of groupPlans) {
+          reportProgress({
+            ready: preparedFileCount,
+            completed: completedFileCount,
+            total: expectedFileCount,
+            phase: 'preparing',
+            experiment: experimentFolder,
+            subExperiment: plan.entry.name,
+          })
+          await ensureExperimentResultsFromJson(plan.entry.name, port, plan.entry.resultsScope)
+          // Render the preparing state and drop its pending timer before the explicit `uploading` state.
+          reportProgress.flush()
+        }
+
+        // One upload session per results source: its CSVs stream to the tunnel manager one at a time (raw
+        // bytes, no base64, no per-request JSON) and the server commits the source once the last file is
+        // in, or in bounded parts when it is large. Nothing accumulates in the browser.
+        let session
         try {
-          experimentFiles = await collectExperimentResultFiles(
-            entry.name,
-            port,
-            entry.resultsScope,
-            ['results.csv', 'results_from_json.csv'],
-            ({
-              ready = 0,
-              completed = 0,
-              experiment = '',
-              subExperiment = '',
-            } = {}) => {
-              preparedFileCount += ready
-              completedFileCount += completed
-              currentExperiment = experiment
-              currentSubExperiment = subExperiment
-              setUploadProgress({
-                ready: preparedFileCount,
-                completed: completedFileCount,
-                total: expectedFileCount,
-                phase: 'collecting',
-                experiment,
-                subExperiment,
-              })
-            },
-            iterations,
-          )
-        } catch {
-          // A folder that cannot be read is skipped; the remaining experiments still upload.
+          session = await startGitHubUploadSession({
+            model: target.model,
+            node: target.node,
+            gpuCount: target.gpuCount,
+            uploadMode,
+            experimentFolder,
+            commitMessage: buildUploadCommitMessage({
+              model: target.model,
+              experimentCount: groupPlans.length,
+              fileCount: groupPlans.reduce((count, plan) => count + plan.iterations.length * 2, 0),
+              sourceLabel,
+            }),
+          })
+        } catch (error) {
+          failedSourceCount += 1
+          lastUploadError =
+            error instanceof Error
+              ? error.message
+              : `Unable to start the GitHub upload session for ${experimentFolder}.`
           continue
         }
 
-        if (experimentFiles.length === 0) {
+        // Stream every sub-experiment of the source into the one session, tallying what each one added so
+        // the counters only move once the whole source is in (a failed source contributes nothing).
+        const planFileCounts = []
+        try {
+          for (const plan of groupPlans) {
+            setUploadProgress({
+              ready: preparedFileCount,
+              completed: completedFileCount,
+              total: expectedFileCount,
+              phase: 'uploading',
+              experiment: experimentFolder,
+              subExperiment: plan.entry.name,
+            })
+
+            const streamed = await streamExperimentResultsToUploadSession({
+              sessionId: session.sessionId,
+              experiment: plan.entry.name,
+              port,
+              resultsScope: plan.entry.resultsScope,
+              experimentFolder,
+              iterationNames: plan.iterations,
+              onProgress: ({
+                ready = 0,
+                completed = 0,
+                experiment = '',
+                subExperiment = '',
+              } = {}) => {
+                preparedFileCount += ready
+                completedFileCount += completed
+                currentExperiment = experiment
+                currentSubExperiment = subExperiment
+                reportProgress({
+                  ready: preparedFileCount,
+                  completed: completedFileCount,
+                  total: expectedFileCount,
+                  phase: 'uploading',
+                  experiment,
+                  subExperiment,
+                })
+              },
+            })
+            reportProgress.flush()
+            planFileCounts.push(streamed.fileCount)
+          }
+        } catch (error) {
+          failedSourceCount += 1
+          lastUploadError =
+            error instanceof Error
+              ? error.message
+              : `Unable to upload the results of ${experimentFolder} to GitHub.`
+          // A half-filled session is dropped instead of leaving it for the janitor; the sweep goes on.
+          await abortGitHubUploadSession(session.sessionId)
           continue
         }
 
-        experimentCount += 1
+        const sourceFileCount = planFileCounts.reduce((count, value) => count + value, 0)
+        experimentCount += planFileCounts.filter((value) => value > 0).length
 
-        // Upload one archive as soon as it has been collected instead of retaining every archive's
-        // base64 payload in the browser until the whole sweep finishes.
+        if (sourceFileCount > 0) {
+          // Commit only once the whole source has streamed in: that is one commit per results source even
+          // though the files travel one request at a time. A source with nothing to send drops its empty
+          // session without committing.
+          try {
+            uploadResults.push(await commitGitHubUploadSession(session.sessionId))
+          } catch (error) {
+            failedSourceCount += 1
+            lastUploadError =
+              error instanceof Error
+                ? error.message
+                : `The GitHub upload could not be committed for ${experimentFolder}.`
+            await abortGitHubUploadSession(session.sessionId)
+            continue
+          }
+        } else {
+          await abortGitHubUploadSession(session.sessionId)
+        }
+
+        uploadedFileCount += sourceFileCount
+
         setUploadProgress({
           ready: preparedFileCount,
           completed: completedFileCount,
           total: expectedFileCount,
           phase: 'uploading',
-          experiment: currentExperiment,
+          experiment: currentExperiment || experimentFolder,
           subExperiment: currentSubExperiment,
         })
-        const experimentCommitMessage = buildUploadCommitMessage({
-          model: target.model,
-          experimentCount: 1,
-          fileCount: experimentFiles.length,
-          sourceLabel,
-        })
-        const requestBatches = splitGitHubUploadFiles({
-          model: target.model,
-          node: target.node,
-          gpuCount: target.gpuCount,
-          commitMessage: experimentCommitMessage,
-          files: experimentFiles,
-        })
-        for (const [batchIndex, batch] of requestBatches.entries()) {
-          uploadResults.push(
-            await requestGitHubUpload({
-              model: target.model,
-              node: target.node,
-              gpuCount: target.gpuCount,
-              commitMessage:
-                requestBatches.length > 1
-                  ? `${experimentCommitMessage} (part ${batchIndex + 1}/${requestBatches.length})`
-                  : experimentCommitMessage,
-              uploadMode,
-              files: batch,
-            }),
-          )
-          uploadedFileCount += batch.length
-          setUploadProgress({
-            ready: preparedFileCount,
-            completed: completedFileCount,
-            total: expectedFileCount,
-            phase: 'uploading',
-            experiment: currentExperiment,
-            subExperiment: currentSubExperiment,
-          })
-        }
       }
 
       if (uploadedFileCount === 0) {
-        setErrorMessage(`No results files found to upload for port ${port}.`)
+        setErrorMessage(
+          failedSourceCount > 0 && lastUploadError
+            ? lastUploadError
+            : `No results files found to upload for port ${port}.`,
+        )
         return
       }
 
@@ -2583,6 +3153,7 @@ function App() {
       )
     } finally {
       setUploadBusyKey('')
+      reportProgress.cancel()
       setUploadProgress(null)
     }
   }
@@ -2750,6 +3321,11 @@ function App() {
     return [...new Set(merged)]
   }, [tunnelState.tunnels])
 
+  // `visiblePorts` is rebuilt every 8 s (the status poll replaces the `tunnels` array), so keying the
+  // port pollers on its identity would restart them constantly. A key string that only changes when the
+  // port set actually changes keeps those effects stable.
+  const visiblePortsKey = useMemo(() => visiblePorts.join(','), [visiblePorts])
+
   // The matrix download icon now opens a two-entry menu, so it has to close like a popover.
   useEffect(() => {
     if (!matrixDownloadMenuOpen) {
@@ -2778,6 +3354,12 @@ function App() {
 
   useEffect(() => {
     let isCancelled = false
+    // Overlap guards: the 20 s poll must not stack a new round on top of one that is still running.
+    let statusesInFlight = false
+    let identitiesInFlight = false
+    // Snapshot the ports from the stable key, so the effect depends on the key (which only changes when
+    // the port set changes) instead of the array identity that the 8 s status poll replaces each time.
+    const ports = visiblePortsKey ? visiblePortsKey.split(',').map(Number) : []
 
     async function fetchPortIdentity(port) {
       try {
@@ -2812,38 +3394,54 @@ function App() {
     }
 
     async function refreshPortStatuses() {
-      const statusEntries = await Promise.all(
-        visiblePorts.map(async (port) => [port, await fetchExperimentStatusForPort(port)]),
-      )
-
-      if (isCancelled) {
+      if (statusesInFlight) {
         return
       }
+      statusesInFlight = true
+      try {
+        const statusEntries = await Promise.all(
+          ports.map(async (port) => [port, await fetchExperimentStatusForPort(port)]),
+        )
 
-      setExperimentStatusByPort((previous) => ({
-        ...previous,
-        ...Object.fromEntries(statusEntries),
-      }))
+        if (isCancelled) {
+          return
+        }
+
+        setExperimentStatusByPort((previous) => ({
+          ...previous,
+          ...Object.fromEntries(statusEntries),
+        }))
+      } finally {
+        statusesInFlight = false
+      }
     }
 
     async function refreshPortIdentities() {
-      const entries = await Promise.all(
-        visiblePorts.map(async (port) => [port, await fetchPortIdentity(port)]),
-      )
-
-      if (isCancelled) {
+      if (identitiesInFlight) {
         return
       }
+      identitiesInFlight = true
+      try {
+        const entries = await Promise.all(
+          ports.map(async (port) => [port, await fetchPortIdentity(port)]),
+        )
 
-      setPortIdentityByPort((previous) => ({
-        ...previous,
-        ...Object.fromEntries(entries),
-      }))
+        if (isCancelled) {
+          return
+        }
+
+        setPortIdentityByPort((previous) => ({
+          ...previous,
+          ...Object.fromEntries(entries),
+        }))
+      } finally {
+        identitiesInFlight = false
+      }
     }
 
     setPortIdentityByPort((previous) => {
       const next = { ...previous }
-      for (const port of visiblePorts) {
+      for (const port of ports) {
         if (!next[port]) {
           next[port] = {
             llm: 'Loading...',
@@ -2858,7 +3456,7 @@ function App() {
 
     setExperimentStatusByPort((previous) => {
       const next = { ...previous }
-      for (const port of visiblePorts) {
+      for (const port of ports) {
         if (!next[port]) {
           next[port] = {
             isRunning: null,
@@ -2882,7 +3480,7 @@ function App() {
       isCancelled = true
       clearInterval(timer)
     }
-  }, [visiblePorts, selectedResultsScope])
+  }, [visiblePortsKey, selectedResultsScope])
 
   // `GET /github/status` only reports whether a token and a repository are configured; the token itself
   // never reaches this bundle. Re-checking when the manager becomes reachable again keeps the upload
@@ -3146,9 +3744,11 @@ function App() {
             <span>
               {uploadProgress.phase === 'uploading'
                 ? `Uploading ${uploadProgress.ready} file(s) to GitHub...`
-                : uploadProgress.total > 0
-                  ? `Preparing upload: ${uploadProgress.ready} of ${uploadProgress.total} file(s) ready`
-                  : 'Preparing upload: finding result files...'}
+                : uploadProgress.phase === 'preparing'
+                  ? `Preparing result files for ${uploadProgress.subExperiment || uploadProgress.experiment}...`
+                  : uploadProgress.total > 0
+                    ? `Preparing upload: ${uploadProgress.ready} of ${uploadProgress.total} file(s) ready`
+                    : 'Preparing upload: finding result files...'}
             </span>
             {uploadProgress.total > 0 && (
               <span>
@@ -3803,6 +4403,91 @@ function App() {
             )}
           </div>
         )}
+      </section>
+
+      <section className="request-timeline-panel">
+        <div className="request-timeline-header">
+          <div>
+            <h2>Requests in flight</h2>
+            <p>
+              {selectedIteration
+                ? `Concurrent requests during iteration ${selectedIteration}`
+                : 'Select an iteration to inspect concurrent requests'}
+            </p>
+          </div>
+          <label className="request-timeline-toggle">
+            <input
+              type="checkbox"
+              checked={showTotalRequests}
+              onChange={(event) => setShowTotalRequests(event.target.checked)}
+              disabled={requestTimeline.profiles.length === 0}
+            />
+            <span>Show total requests</span>
+          </label>
+        </div>
+
+        <div className="request-timeline-chart">
+          {requestTimelineLoading ? (
+            <p className="placeholder">Loading request timeline...</p>
+          ) : requestTimeline.data.length === 0 ? (
+            <p className="placeholder">
+              No request timing data is available for this iteration.
+            </p>
+          ) : (
+            <ResponsiveContainer width="100%" height={330}>
+              <ComposedChart
+                data={requestTimeline.data}
+                margin={{ top: 16, right: 18, left: 8, bottom: 12 }}
+              >
+                <CartesianGrid strokeDasharray="4 6" stroke="#d2dce5" />
+                <XAxis
+                  type="number"
+                  dataKey="time"
+                  domain={[0, 'dataMax']}
+                  label={{ value: 'Time (seconds)', position: 'insideBottom', offset: -6 }}
+                  tickFormatter={(value) => `${value}s`}
+                />
+                <YAxis
+                  allowDecimals={false}
+                  label={{ value: 'Requests ongoing', angle: -90, position: 'insideLeft' }}
+                />
+                <Tooltip
+                  formatter={(value, name) => [value, name === 'total' ? 'Total requests' : name]}
+                  labelFormatter={(value, payload) =>
+                    payload?.[0]?.payload?.displayTime
+                      ? `${payload[0].payload.displayTime} (${value}s)`
+                      : `${value}s`
+                  }
+                />
+                <Legend
+                  formatter={(value) => (value === 'total' ? 'Total requests' : value)}
+                />
+                {showTotalRequests ? (
+                  <Line
+                    type="stepAfter"
+                    dataKey="total"
+                    name="total"
+                    stroke="#111827"
+                    strokeWidth={2.8}
+                    dot={false}
+                  />
+                ) : (
+                  requestTimeline.profiles.map((profile, index) => (
+                    <Line
+                      type="stepAfter"
+                      dataKey={profile}
+                      name={profile}
+                      key={profile}
+                      stroke={WORKLOAD_PROFILE_COLORS[index % WORKLOAD_PROFILE_COLORS.length]}
+                      strokeWidth={2.4}
+                      dot={false}
+                    />
+                  ))
+                )}
+              </ComposedChart>
+            </ResponsiveContainer>
+          )}
+        </div>
       </section>
     </div>
   )
