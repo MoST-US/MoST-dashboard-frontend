@@ -1124,9 +1124,9 @@ export async function uploadResults({
 // That buffered the whole experiment (plus its base64 spelling and the enclosing JSON) in the browser
 // and again in the tunnel manager before a single commit was created, so a sweep of a few thousand
 // small files could pin hundreds of megabytes on the manager's single thread and stall `/status` with
-// it. A session removes that peak: the dashboard opens one session per results source, posts each CSV
-// as its raw bytes (one request per file), and the server keeps only the pending tree and commits it -
-// one commit per results source - once the files are in, or in bounded parts when the source is large.
+// it. A session removes that peak: the dashboard opens one session per sub-experiment, posts each CSV
+// as its raw bytes (one request per file), and the server keeps only that sub-experiment's pending tree
+// before committing it, or splitting it into bounded parts when it is large.
 //
 // A session lives in this module (a plain Map) because the tunnel manager is a single process. It is
 // pruned after UPLOAD_SESSION_TTL_MS of inactivity, so an upload the browser abandons (tab closed,
@@ -1143,6 +1143,18 @@ export const UPLOAD_SESSION_FLUSH_BYTES = 4 * 1024 * 1024
 
 const uploadSessions = new Map()
 
+function disposeUploadSession(session) {
+  // A completed session can have thousands of path strings and a large existing-path Set. Clear
+  // those references before removing the session so the manager can reclaim them without waiting
+  // for a long-lived request or the janitor.
+  session.pending = []
+  session.existingPaths = null
+  session.rawByTreePath.clear()
+  session.trimmedByExperiment.clear()
+  session.shortened.clear()
+  session.addChain = Promise.resolve()
+}
+
 function sessionInlineEntryBytes(treePath, content) {
   return Buffer.byteLength(
     JSON.stringify({ path: treePath, mode: '100644', type: 'blob', content }),
@@ -1154,7 +1166,11 @@ function sessionInlineEntryBytes(treePath, content) {
 export function pruneUploadSessions(now = Date.now()) {
   let removed = 0
   for (const [id, session] of uploadSessions) {
+    if (session.activeTasks > 0) {
+      continue
+    }
     if (now - session.lastActivityAt > UPLOAD_SESSION_TTL_MS) {
+      disposeUploadSession(session)
       uploadSessions.delete(id)
       removed += 1
     }
@@ -1291,6 +1307,10 @@ export async function createUploadSession({
     shortenedCount: 0,
     createdAt: Date.now(),
     lastActivityAt: Date.now(),
+    activeTasks: 0,
+    // Tail of the per-session task chain (see `enqueueSessionTask`). The browser streams several files
+    // at once now, so the shared bookkeeping below must be applied one task at a time.
+    addChain: Promise.resolve(),
   }
 
   if (mode === 'update') {
@@ -1315,12 +1335,44 @@ function findUploadSession(id) {
   return session
 }
 
+// Runs `task` strictly after every task already queued for this session, and returns its result. The
+// browser streams several files of one session concurrently, so the counters, the pending tree and any
+// automatic flush must be applied one at a time or two overlapping adds could double-flush or drop a
+// file. Tasks of different sessions are independent and still run in parallel. A rejected task never
+// breaks the chain: the stored tail swallows both outcomes so the next task still runs.
+function enqueueSessionTask(session, task) {
+  session.activeTasks += 1
+  session.lastActivityAt = Date.now()
+  const result = session.addChain.then(async () => {
+    session.lastActivityAt = Date.now()
+    try {
+      return await task()
+    } finally {
+      session.activeTasks -= 1
+      session.lastActivityAt = Date.now()
+    }
+  })
+  session.addChain = result.then(
+    () => {},
+    () => {},
+  )
+  return result
+}
+
 // Adds one CSV (raw bytes, already the file itself) to the session. The path is validated and trimmed
 // exactly as `uploadResults` does it, so a session produces the same tree a one-shot upload would.
+// The body runs through the session's task chain (see `enqueueSessionTask`) so overlapping file posts
+// - the browser streams several at once - are applied one after another and never race the counters,
+// the pending tree or an automatic flush.
 export async function addUploadSessionFile({ id, relativePath, content, fetchImpl } = {}) {
   const session = findUploadSession(id)
-  session.lastActivityAt = Date.now()
 
+  return enqueueSessionTask(session, () =>
+    addUploadSessionFileLocked(session, { relativePath, content, fetchImpl }),
+  )
+}
+
+async function addUploadSessionFileLocked(session, { relativePath, content, fetchImpl } = {}) {
   const request = fetchImpl || globalThis.fetch
   const requestOptions = { fetchImpl: request, config: session.config }
   const { repo } = session.config
@@ -1622,16 +1674,26 @@ export async function commitUploadSession({ id, fetchImpl } = {}) {
   const request = fetchImpl || globalThis.fetch
 
   try {
-    await flushUploadSession(session, request)
+    // Queue the final flush behind any file post still in flight, so the commit captures everything the
+    // browser sent and nothing mutates the session after it (the browser only commits once every post
+    // has resolved, but this makes the ordering explicit and race-free).
+    await enqueueSessionTask(session, () => flushUploadSession(session, request))
     return buildUploadSessionSummary(session)
   } finally {
     session.lastActivityAt = Date.now()
+    session.activeTasks = 0
+    disposeUploadSession(session)
     uploadSessions.delete(session.id)
   }
 }
 
 // Drops a session without committing it, for a sweep that failed part-way through.
 export function abortUploadSession({ id } = {}) {
-  return uploadSessions.delete(String(id ?? ''))
-}
+  const session = uploadSessions.get(String(id ?? ''))
+  if (!session) {
+    return false
+  }
 
+  disposeUploadSession(session)
+  return uploadSessions.delete(session.id)
+}

@@ -764,7 +764,7 @@ async function handleGitHubUploadSessionFile(req, res, sessionId, urlObject) {
   }
 }
 
-// Commits the session (one commit per results source, or bounded parts for a large one) and closes it.
+// Commits the session (one sub-experiment, or bounded parts for a large one) and closes it.
 async function handleGitHubUploadSessionCommit(req, res, sessionId) {
   if (!isGitHubConfigured(githubConfig)) {
     jsonResponse(res, 409, {

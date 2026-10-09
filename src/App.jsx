@@ -294,7 +294,13 @@ function buildRequestTimeline(rows) {
 
   events.sort((a, b) => a.timestamp - b.timestamp || a.order - b.order)
   const counts = Object.fromEntries([...profiles].map((profile) => [profile, 0]))
-  const data = [{ time: 0, total: 0, displayTime: new Date(origin).toISOString() }]
+  const cumulativeCounts = Object.fromEntries([...profiles].map((profile) => [profile, 0]))
+  const data = [{
+    time: 0,
+    total: 0,
+    cumulative: { ...cumulativeCounts },
+    displayTime: new Date(origin).toISOString(),
+  }]
 
   let index = 0
   while (index < events.length) {
@@ -302,12 +308,16 @@ function buildRequestTimeline(rows) {
     while (index < events.length && events[index].timestamp === timestamp) {
       const event = events[index]
       counts[event.profile] += event.delta
+      if (event.delta > 0) {
+        cumulativeCounts[event.profile] += event.delta
+      }
       index += 1
     }
 
     data.push({
       time: (timestamp - origin) / 1000,
       total: Object.values(counts).reduce((sum, count) => sum + count, 0),
+      cumulative: { ...cumulativeCounts },
       displayTime: new Date(timestamp).toISOString(),
       ...counts,
     })
@@ -492,6 +502,22 @@ function buildTunnelUrl(pathname) {
 const UPLOAD_REQUEST_TIMEOUT_MS = 120000
 const UPLOAD_LONG_REQUEST_TIMEOUT_MS = 600000
 
+// How many result files the browser streams at once. A sweep used to move one file at a time, which
+// left the SSH-tunnel download hop idle between every file and made a many-file upload latency bound.
+// A small pool keeps a little download parallelism without overwhelming the tunnel manager. Session
+// bookkeeping and GitHub tree updates are serialized server-side, so a large browser-side pool only
+// increases queued request bodies and memory pressure. Override with
+// VITE_UPLOAD_FILE_CONCURRENCY if a link tolerates more.
+const UPLOAD_FILE_CONCURRENCY = (() => {
+  const configured = Number(import.meta.env.VITE_UPLOAD_FILE_CONCURRENCY)
+  return Number.isInteger(configured) && configured > 0 ? Math.min(configured, 8) : 2
+})()
+
+// Derived result preparation can start a Python conversion on the API host. Keep this lower than
+// the file-transfer pool so a port-wide upload cannot start one conversion for every matrix cell.
+const UPLOAD_PREPARATION_CONCURRENCY = 2
+const UPLOAD_PROGRESS_UPDATE_INTERVAL_MS = 400
+
 // `fetch` with an AbortController deadline. Every upload-related request goes through it so a hop that
 // never answers surfaces as a retryable timeout instead of an unending wait.
 async function fetchWithTimeout(url, options = {}, timeoutMs = UPLOAD_REQUEST_TIMEOUT_MS) {
@@ -549,6 +575,43 @@ async function withUploadRetry(run, { attempts = 3, baseDelayMs = 750 } = {}) {
     }
   }
   throw lastError
+}
+
+// Runs `worker` over `items` with at most `limit` in flight. Starts tasks from a shared cursor so slow
+// items do not block the queue, and drains every in-flight task even after the first failure: the
+// remaining started tasks finish, no new one starts, and the first error is rethrown. Draining (rather
+// than rejecting immediately, as `Promise.all` would) matters here because a half-open upload session
+// must see every posted file settle before the caller aborts it, and it keeps a late rejection from
+// surfacing as an unhandled promise.
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length)
+  let nextIndex = 0
+  let firstError = null
+  const workers = Math.max(1, Math.min(limit, items.length))
+
+  await Promise.all(
+    Array.from({ length: workers }, async () => {
+      while (firstError === null) {
+        const index = nextIndex
+        nextIndex += 1
+        if (index >= items.length) {
+          return
+        }
+
+        try {
+          results[index] = await worker(items[index], index)
+        } catch (error) {
+          firstError = error
+        }
+      }
+    }),
+  )
+
+  if (firstError) {
+    throw firstError
+  }
+
+  return results
 }
 
 function parseExperimentPair(experimentName) {
@@ -918,6 +981,23 @@ function formatResultsScopeLabel(scope) {
   }
 
   return scope
+}
+
+function groupUploadExperiments(experiments) {
+  const groups = new Map()
+
+  for (const entry of experiments || []) {
+    const scope = entry.resultsScope || DEFAULT_RESULTS_SCOPE
+    if (!groups.has(scope)) {
+      groups.set(scope, [])
+    }
+    groups.get(scope).push(entry)
+  }
+
+  return [...groups.entries()].map(([resultsScope, entries]) => ({
+    resultsScope,
+    entries,
+  }))
 }
 
 // Labels the commit of an upload that covers a whole set of results sources at once: the archive name
@@ -1458,33 +1538,62 @@ function createThrottledProgress(apply, minIntervalMs = 150) {
   return report
 }
 
+// The fraction (0..1) the upload bar shows. Once files stream it tracks `completed`/`ready` against
+// the expected file count; while a results source is still being prepared (no file streamed yet) it
+// falls back to the source counter, so the bar can never sit pinned at 0% during the prepare phase.
+function uploadProgressFraction(progress) {
+  if (!progress) {
+    return 0
+  }
+
+  if (progress.total > 0) {
+    return Math.min((progress.completed ?? progress.ready ?? 0) / progress.total, 1)
+  }
+
+  if (progress.groupCount > 0) {
+    return Math.min((progress.preparedGroups || 0) / progress.groupCount, 1)
+  }
+
+  return 0
+}
+
 // Asks the API to prepare every derived results_from_json.csv an experiment is missing in one
-// server pass, before the upload streams them. Best-effort: an API without the endpoint (or a
-// failed pass) still lets each file convert on demand during its download, only slowly.
-async function ensureExperimentResultsFromJson(experiment, port, resultsScope) {
+// server pass, so the upload that follows streams cache hits instead of spawning a Python process
+// per file mid-sweep. Strictly best-effort and time-boxed: the per-file download endpoint still
+// converts on demand, so a slow or failing pass must never block (or outlive) the upload it warms.
+// No retries: the server's own batch budget is an hour, far past anything a progress bar should wait.
+const ENSURE_RESULTS_TIMEOUT_MS = 120000
+
+async function ensureExperimentResultsFromJson(
+  experiment,
+  port,
+  resultsScope,
+  timeoutMs = ENSURE_RESULTS_TIMEOUT_MS,
+) {
   try {
     const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/ensure-results-from-json`
-    return await withUploadRetry(async () => {
-      const response = await fetchWithTimeout(
-        buildApiUrl(endpoint, port, { resultsScope }),
-        { method: 'POST' },
-        UPLOAD_LONG_REQUEST_TIMEOUT_MS,
-      )
-      if (response.ok) {
-        return await response.json()
-      }
-      throw uploadHttpError(`Results preparation failed (HTTP ${response.status}).`, response.status)
-    })
+    const response = await fetchWithTimeout(
+      buildApiUrl(endpoint, port, { resultsScope }),
+      { method: 'POST' },
+      timeoutMs,
+    )
+    if (response.ok) {
+      return await response.json()
+    }
+    throw uploadHttpError(`Results preparation failed (HTTP ${response.status}).`, response.status)
   } catch {
     // Best-effort: per-file downloads still convert on demand if this pass fails or times out.
     return null
   }
 }
 
-// Streams an experiment's result CSVs to an open upload session, one file at a time: each blob is
-// posted as raw bytes as soon as it is fetched and then dropped, so only a single file (never the
-// whole experiment, never its base64 spelling) is held in the browser at any moment. `onProgress`
-// mirrors the batched collector so the progress bar keeps its meaning.
+// Streams an experiment's result CSVs to an open upload session: each blob is posted as raw bytes as
+// soon as it is fetched and then dropped, so the browser never holds the whole experiment (nor its
+// base64 spelling). Transfers run through a small pool (`UPLOAD_FILE_CONCURRENCY`) instead of strictly
+// one file at a time, because the SSH-tunnel download hop dominates and used to sit idle between files.
+// Peak browser memory is the pool size times one file. The server serializes the per-session
+// bookkeeping (see `addUploadSessionFile`), so the parallel posts stay correct. `onProgress` mirrors the
+// batched collector so the progress bar keeps its meaning.
 async function streamExperimentResultsToUploadSession({
   sessionId,
   experiment,
@@ -1505,38 +1614,45 @@ async function streamExperimentResultsToUploadSession({
 
   let fileCount = 0
 
+  // One independent transfer per (iteration, file): the two files of an iteration are as independent of
+  // each other as two iterations are, so they all share one pool instead of two nested serial loops.
+  const tasks = []
   for (const iterationName of iterations) {
-    // Sequential on purpose: the two files of an iteration are independent, but posting them one after
-    // the other (instead of fetching both blobs together) is what keeps the browser's peak at one file.
     for (const fileName of fileNames) {
-      onProgress?.({
-        experiment: experimentFolder,
-        subExperiment: experiment,
-      })
-
-      const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/${fileName}`
-      const blob = await withUploadRetry(async () => {
-        const response = await fetchWithTimeout(buildApiUrl(endpoint, port, { resultsScope }))
-        if (!response.ok) {
-          throw uploadHttpError(
-            `The file ${fileName} could not be downloaded (HTTP ${response.status}).`,
-            response.status,
-          )
-        }
-        return response.blob()
-      }).catch(() => null)
-
-      if (!blob) {
-        // A missing file (or a download that keeps failing) is skipped; the rest of the sweep goes on.
-        onProgress?.({ completed: 1 })
-        continue
-      }
-
-      await uploadGitHubSessionFile(sessionId, `${experiment}/${iterationName}/${fileName}`, blob)
-      fileCount += 1
-      onProgress?.({ ready: 1, completed: 1 })
+      tasks.push({ iterationName, fileName })
     }
   }
+
+  await runWithConcurrency(tasks, UPLOAD_FILE_CONCURRENCY, async ({ iterationName, fileName }) => {
+    onProgress?.({
+      experiment: experimentFolder,
+      subExperiment: experiment,
+    })
+
+    const endpoint = `/api/experiments/${encodeURIComponent(experiment)}/iterations/${encodeURIComponent(iterationName)}/download/${fileName}`
+    const blob = await withUploadRetry(async () => {
+      const response = await fetchWithTimeout(buildApiUrl(endpoint, port, { resultsScope }))
+      if (!response.ok) {
+        throw uploadHttpError(
+          `The file ${fileName} could not be downloaded (HTTP ${response.status}).`,
+          response.status,
+        )
+      }
+      return response.blob()
+    }).catch(() => null)
+
+    if (!blob) {
+      // A missing file (or a download that keeps failing) is skipped; the rest of the sweep goes on.
+      onProgress?.({ completed: 1 })
+      return
+    }
+
+    await uploadGitHubSessionFile(sessionId, `${experiment}/${iterationName}/${fileName}`, blob)
+    // A plain synchronous increment between awaits: the event loop never interleaves it, so the shared
+    // counter stays exact however many transfers are in flight.
+    fileCount += 1
+    onProgress?.({ ready: 1, completed: 1 })
+  })
 
   return { fileCount }
 }
@@ -1863,7 +1979,9 @@ function App() {
   const [selectedIterationRows, setSelectedIterationRows] = useState([])
   const [requestTimeline, setRequestTimeline] = useState({ data: [], profiles: [] })
   const [requestTimelineLoading, setRequestTimelineLoading] = useState(false)
-  const [showTotalRequests, setShowTotalRequests] = useState(false)
+  const [requestTimelineCalculatedFor, setRequestTimelineCalculatedFor] = useState('')
+  const [requestMetric, setRequestMetric] = useState('concurrent')
+  const requestTimelineRequestIdRef = useRef(0)
   const [hoveredSummary, setHoveredSummary] = useState(null)
   const [loadingIterations, setLoadingIterations] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
@@ -1905,6 +2023,7 @@ function App() {
   const [githubUploadMode, setGitHubUploadMode] = useState('update')
   const [uploadProgress, setUploadProgress] = useState(null)
   const [uploadNotice, setUploadNotice] = useState(null)
+  const [portUploadSelection, setPortUploadSelection] = useState(null)
   // Answers given through the GPU-count prompt, remembered per port for the rest of the session.
   const uploadGpuCountOverridesRef = useRef({})
 
@@ -2226,47 +2345,51 @@ function App() {
   }, [selectedExperiment, activeApiPort, selectedResultsScope])
 
   useEffect(() => {
-    if (!selectedExperiment || !selectedIteration) {
-      setRequestTimeline({ data: [], profiles: [] })
-      return undefined
+    requestTimelineRequestIdRef.current += 1
+    setRequestTimeline({ data: [], profiles: [] })
+    setRequestTimelineCalculatedFor('')
+    setRequestTimelineLoading(false)
+  }, [selectedExperiment, selectedIteration, activeApiPort, selectedResultsScope])
+
+  async function calculateRequestTimeline() {
+    if (!selectedExperiment || !selectedIteration || requestTimelineLoading) {
+      return
     }
 
-    let isCancelled = false
+    const requestId = requestTimelineRequestIdRef.current + 1
+    requestTimelineRequestIdRef.current = requestId
+    setRequestTimelineLoading(true)
+    setRequestTimelineCalculatedFor('')
 
-    async function loadRequestTimeline() {
-      setRequestTimelineLoading(true)
-      try {
-        const endpoint = `/api/experiments/${encodeURIComponent(selectedExperiment)}/iterations/${encodeURIComponent(selectedIteration)}/download/results_from_json.csv`
-        const response = await fetch(
-          buildApiUrl(endpoint, activeApiPort, { resultsScope: selectedResultsScope }),
+    try {
+      const endpoint = `/api/experiments/${encodeURIComponent(selectedExperiment)}/iterations/${encodeURIComponent(selectedIteration)}/download/results_from_json.csv`
+      const response = await fetch(
+        buildApiUrl(endpoint, activeApiPort, { resultsScope: selectedResultsScope }),
+      )
+      if (!response.ok) {
+        throw new Error(`Request timeline failed (${response.status}).`)
+      }
+
+      const timeline = buildRequestTimeline(parseCsv(await response.text()))
+      if (requestTimelineRequestIdRef.current !== requestId) {
+        return
+      }
+
+      setRequestTimeline(timeline)
+      setRequestTimelineCalculatedFor(selectedIteration)
+    } catch {
+      if (requestTimelineRequestIdRef.current === requestId) {
+        setRequestTimeline({ data: [], profiles: [] })
+        setErrorMessage(
+          `Unable to load request timeline for ${selectedIteration} on port ${activeApiPort}.`,
         )
-        if (!response.ok) {
-          throw new Error(`Request timeline failed (${response.status}).`)
-        }
-
-        const timeline = buildRequestTimeline(parseCsv(await response.text()))
-        if (!isCancelled) {
-          setRequestTimeline(timeline)
-        }
-      } catch {
-        if (!isCancelled) {
-          setRequestTimeline({ data: [], profiles: [] })
-          setErrorMessage(
-            `Unable to load request timeline for ${selectedIteration} on port ${activeApiPort}.`,
-          )
-        }
-      } finally {
-        if (!isCancelled) {
-          setRequestTimelineLoading(false)
-        }
+      }
+    } finally {
+      if (requestTimelineRequestIdRef.current === requestId) {
+        setRequestTimelineLoading(false)
       }
     }
-
-    loadRequestTimeline()
-    return () => {
-      isCancelled = true
-    }
-  }, [selectedExperiment, selectedIteration, activeApiPort, selectedResultsScope])
+  }
 
   const selectedPoint = useMemo(
     () => iterationData.find((point) => point.iteration === selectedIteration) || null,
@@ -2899,7 +3022,10 @@ function App() {
     // Rate-limits the progress re-renders: a sweep of thousands of files would otherwise set state
     // twice per file. The counters below stay exact; only the render is coalesced, and `cancel` in
     // the finally stops a trailing update from resurrecting the bar after it has been cleared.
-    const reportProgress = createThrottledProgress((payload) => setUploadProgress(payload))
+    const reportProgress = createThrottledProgress(
+      (payload) => setUploadProgress(payload),
+      UPLOAD_PROGRESS_UPDATE_INTERVAL_MS,
+    )
 
     try {
       const target = await resolveUploadTarget(port, identity, entries)
@@ -2924,6 +3050,7 @@ function App() {
             `/api/experiments/${encodeURIComponent(entry.name)}/iterations`,
             port,
             { resultsScope: entry.resultsScope },
+            UPLOAD_LONG_REQUEST_TIMEOUT_MS,
           )
           const iterations = iterationResponse.iterations || []
           const fileCount = iterations.length * 2
@@ -2941,11 +3068,9 @@ function App() {
         phase: 'collecting',
       })
 
-      // Group the experiments by results source. Every sub-experiment of one archive shares its experiment
-      // folder, so a whole archive uploads through a single session and commits once: a sweep of N
-      // experiments becomes S commits (one per source) instead of N, which keeps a thousands-file upload
-      // well clear of GitHub's secondary rate limits. A source that fails is dropped and the rest of the
-      // sweep goes on, so one stall no longer freezes the whole upload.
+      // Group the experiments by results source. Preparation is shared per source, while the upload
+      // session below is deliberately scoped to one sub-experiment. This bounds the lifetime and memory
+      // of every session and makes a failed cell independent from the rest of the archive.
       const planGroups = new Map()
       for (const plan of collectionPlans) {
         const experimentFolder = buildUploadExperimentFolder(plan.entry.resultsScope)
@@ -2958,57 +3083,72 @@ function App() {
       let failedSourceCount = 0
       let lastUploadError = ''
 
-      for (const [experimentFolder, groupPlans] of planGroups) {
-        // Prepare the derived per-request CSV of every iteration in one server pass before opening the
-        // session. The upload streams that file for each iteration, and deriving it lazily (one Python
-        // process per file, interleaved with the upload) is what used to stall a large sweep partway
-        // through. Best-effort: per-file downloads still convert on demand.
+      // Prepare the derived per-request CSV of every iteration in one server pass so the upload that
+      // follows streams cache hits instead of spawning a Python process per file mid-sweep (deriving
+      // lazily, one file at a time interleaved with the upload, is what used to stall a large sweep).
+      // Best-effort and time-boxed: the per-file download endpoint still converts on demand, so the
+      // pass can never pin the sweep at 0%. Sources are pipelined: while one streams and commits, the
+      // next source's CSVs are warmed in the background.
+      const groups = [...planGroups.entries()]
+      const prepareGroup = (groupPlans) =>
+        runWithConcurrency(
+          groupPlans || [],
+          UPLOAD_PREPARATION_CONCURRENCY,
+          (plan) => ensureExperimentResultsFromJson(plan.entry.name, port, plan.entry.resultsScope),
+        )
+
+      let prepareAhead = null
+      for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+        const [experimentFolder, groupPlans] = groups[groupIndex]
+
+        // Report the preparing state (a real, advancing per-source counter) so the bar is never a
+        // frozen 0.0% while the first files are being derived and no session exists yet.
+        reportProgress({
+          ready: preparedFileCount,
+          completed: completedFileCount,
+          total: expectedFileCount,
+          phase: 'preparing',
+          experiment: experimentFolder,
+          subExperiment: groupPlans[0]?.entry?.name,
+          preparedGroups: groupIndex,
+          groupCount: groups.length,
+        })
+        // Render the preparing state and drop its pending timer before the explicit `uploading` state.
+        reportProgress.flush()
+
+        // Wait (bounded) for this source's preparation, then warm the next one while this one streams.
+        await prepareAhead
+        prepareAhead = prepareGroup(groups[groupIndex + 1]?.[1])
+
         for (const plan of groupPlans) {
-          reportProgress({
-            ready: preparedFileCount,
-            completed: completedFileCount,
-            total: expectedFileCount,
-            phase: 'preparing',
-            experiment: experimentFolder,
-            subExperiment: plan.entry.name,
-          })
-          await ensureExperimentResultsFromJson(plan.entry.name, port, plan.entry.resultsScope)
-          // Render the preparing state and drop its pending timer before the explicit `uploading` state.
-          reportProgress.flush()
-        }
-
-        // One upload session per results source: its CSVs stream to the tunnel manager one at a time (raw
-        // bytes, no base64, no per-request JSON) and the server commits the source once the last file is
-        // in, or in bounded parts when it is large. Nothing accumulates in the browser.
-        let session
-        try {
-          session = await startGitHubUploadSession({
-            model: target.model,
-            node: target.node,
-            gpuCount: target.gpuCount,
-            uploadMode,
-            experimentFolder,
-            commitMessage: buildUploadCommitMessage({
+          // One session per sub-experiment: raw CSVs stream directly to the manager and are committed
+          // together, without retaining the rest of the source in the browser or server.
+          let session
+          try {
+            session = await startGitHubUploadSession({
               model: target.model,
-              experimentCount: groupPlans.length,
-              fileCount: groupPlans.reduce((count, plan) => count + plan.iterations.length * 2, 0),
-              sourceLabel,
-            }),
-          })
-        } catch (error) {
-          failedSourceCount += 1
-          lastUploadError =
-            error instanceof Error
-              ? error.message
-              : `Unable to start the GitHub upload session for ${experimentFolder}.`
-          continue
-        }
+              node: target.node,
+              gpuCount: target.gpuCount,
+              uploadMode,
+              experimentFolder,
+              commitMessage: buildUploadCommitMessage({
+                model: target.model,
+                experimentCount: 1,
+                fileCount: plan.iterations.length * 2,
+                sourceLabel,
+              }),
+            })
+          } catch (error) {
+            failedSourceCount += 1
+            lastUploadError =
+              error instanceof Error
+                ? error.message
+                : `Unable to start the GitHub upload session for ${plan.entry.name}.`
+            continue
+          }
 
-        // Stream every sub-experiment of the source into the one session, tallying what each one added so
-        // the counters only move once the whole source is in (a failed source contributes nothing).
-        const planFileCounts = []
-        try {
-          for (const plan of groupPlans) {
+          let subExperimentFileCount = 0
+          try {
             setUploadProgress({
               ready: preparedFileCount,
               completed: completedFileCount,
@@ -3046,51 +3186,45 @@ function App() {
               },
             })
             reportProgress.flush()
-            planFileCounts.push(streamed.fileCount)
-          }
-        } catch (error) {
-          failedSourceCount += 1
-          lastUploadError =
-            error instanceof Error
-              ? error.message
-              : `Unable to upload the results of ${experimentFolder} to GitHub.`
-          // A half-filled session is dropped instead of leaving it for the janitor; the sweep goes on.
-          await abortGitHubUploadSession(session.sessionId)
-          continue
-        }
-
-        const sourceFileCount = planFileCounts.reduce((count, value) => count + value, 0)
-        experimentCount += planFileCounts.filter((value) => value > 0).length
-
-        if (sourceFileCount > 0) {
-          // Commit only once the whole source has streamed in: that is one commit per results source even
-          // though the files travel one request at a time. A source with nothing to send drops its empty
-          // session without committing.
-          try {
-            uploadResults.push(await commitGitHubUploadSession(session.sessionId))
+            subExperimentFileCount = streamed.fileCount
           } catch (error) {
             failedSourceCount += 1
             lastUploadError =
               error instanceof Error
                 ? error.message
-                : `The GitHub upload could not be committed for ${experimentFolder}.`
+                : `Unable to upload the results of ${plan.entry.name} to GitHub.`
             await abortGitHubUploadSession(session.sessionId)
             continue
           }
-        } else {
-          await abortGitHubUploadSession(session.sessionId)
+
+          if (subExperimentFileCount > 0) {
+            try {
+              uploadResults.push(await commitGitHubUploadSession(session.sessionId))
+            } catch (error) {
+              failedSourceCount += 1
+              lastUploadError =
+                error instanceof Error
+                  ? error.message
+                  : `The GitHub upload could not be committed for ${plan.entry.name}.`
+              await abortGitHubUploadSession(session.sessionId)
+              continue
+            }
+          } else {
+            await abortGitHubUploadSession(session.sessionId)
+          }
+
+          experimentCount += subExperimentFileCount > 0 ? 1 : 0
+          uploadedFileCount += subExperimentFileCount
+
+          setUploadProgress({
+            ready: preparedFileCount,
+            completed: completedFileCount,
+            total: expectedFileCount,
+            phase: 'uploading',
+            experiment: currentExperiment || experimentFolder,
+            subExperiment: currentSubExperiment,
+          })
         }
-
-        uploadedFileCount += sourceFileCount
-
-        setUploadProgress({
-          ready: preparedFileCount,
-          completed: completedFileCount,
-          total: expectedFileCount,
-          phase: 'uploading',
-          experiment: currentExperiment || experimentFolder,
-          subExperiment: currentSubExperiment,
-        })
       }
 
       if (uploadedFileCount === 0) {
@@ -3237,17 +3371,14 @@ function App() {
     })
   }
 
-  // Per-tunnel button: every finished sub-experiment of every completed results source of the port.
-  // The ongoing `current` source is not part of that set (see
-  // collectFinishedExperimentsFromCompletedSources), so a run that is still executing is never
-  // committed halfway: the archive it becomes is uploaded once the run ends. This works for a port the
-  // dashboard is not currently viewing as well, since the sources are listed for that port.
+  // Per-tunnel button: collect every finished sub-experiment first, then let the operator choose which
+  // entries to upload. The ongoing `current` source is not part of that set.
   async function uploadTunnelResultsToGitHub(port) {
-    if (uploadBusyKey) {
+    if (uploadBusyKey || portUploadSelection) {
       return
     }
 
-    setUploadBusyKey(`port:${port}`)
+    setPortUploadSelection({ port, loading: true, experiments: [], selectedKeys: new Set() })
     setUploadProgress({ ready: 0, total: 0, phase: 'collecting' })
     setUploadNotice(null)
     setErrorMessage('')
@@ -3257,7 +3388,7 @@ function App() {
     try {
       collected = await collectFinishedExperimentsFromCompletedSources(port)
     } catch {
-      setUploadBusyKey('')
+      setPortUploadSelection(null)
       setUploadProgress(null)
       setErrorMessage(
         `Unable to list the completed results sources of port ${port} for the upload.`,
@@ -3265,10 +3396,10 @@ function App() {
       return
     }
 
-    setUploadBusyKey('')
     setUploadProgress(null)
 
     if (collected.experiments.length === 0) {
+      setPortUploadSelection(null)
       setErrorMessage(
         `No finished experiment with results was found in the completed results sources of port ${port}${
           collected.skipped.length > 0
@@ -3279,12 +3410,47 @@ function App() {
       return
     }
 
+    setPortUploadSelection({
+      port,
+      loading: false,
+      experiments: collected.experiments,
+      skippedCount: collected.skipped.length,
+      expandedScopes: new Set(collected.resultsScopes),
+      selectedKeys: new Set(
+        collected.experiments.map((entry) => `${entry.resultsScope}::${entry.name}`),
+      ),
+    })
+  }
+
+  function cancelPortUploadSelection() {
+    if (uploadBusyKey) {
+      return
+    }
+
+    setPortUploadSelection(null)
+  }
+
+  async function confirmPortUploadSelection() {
+    if (!portUploadSelection || portUploadSelection.loading || uploadBusyKey) {
+      return
+    }
+
+    const selectedExperiments = portUploadSelection.experiments.filter((entry) =>
+      portUploadSelection.selectedKeys.has(`${entry.resultsScope}::${entry.name}`),
+    )
+    if (selectedExperiments.length === 0) {
+      setErrorMessage('Select at least one finished experiment to upload.')
+      return
+    }
+
+    const { port, skippedCount } = portUploadSelection
+    setPortUploadSelection(null)
     await uploadExperimentsToGitHub({
       port,
-      experiments: collected.experiments,
+      experiments: selectedExperiments,
       busyKey: `port:${port}`,
       identity: portIdentityByPort[port],
-      skippedCount: collected.skipped.length,
+      skippedCount,
       uploadMode: githubUploadMode,
     })
   }
@@ -3718,7 +3884,8 @@ function App() {
                       !githubStatus.configured ||
                       tunnelTone === 'down' ||
                       restartBusy ||
-                      Boolean(uploadBusyKey)
+                      Boolean(uploadBusyKey) ||
+                      Boolean(portUploadSelection)
                     }
                     title={
                       githubStatus.configured
@@ -3727,7 +3894,11 @@ function App() {
                     }
                   >
                     <Upload size={16} />
-                    {uploadBusyKey === `port:${port}` ? 'Uploading...' : 'Upload results'}
+                    {uploadBusyKey === `port:${port}`
+                      ? 'Uploading...'
+                      : portUploadSelection?.port === port
+                        ? 'Selecting...'
+                        : 'Upload results'}
                   </button>
                 </div>
               </div>
@@ -3735,6 +3906,165 @@ function App() {
           })}
         </div>
       </section>
+
+      {portUploadSelection && (
+        <section
+          className="port-upload-selector"
+          role="dialog"
+          aria-labelledby="port-upload-selector-title"
+        >
+          <div className="port-upload-selector-header">
+            <div>
+              <h2 id="port-upload-selector-title">
+                Select experiments for port {portUploadSelection.port}
+              </h2>
+              <p>
+                Choose which finished experiments should be uploaded to GitHub.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="selector-close"
+              onClick={cancelPortUploadSelection}
+              disabled={portUploadSelection.loading}
+              aria-label="Cancel experiment selection"
+            >
+              Cancel
+            </button>
+          </div>
+          {portUploadSelection.loading ? (
+            <p className="placeholder">Finding finished experiments...</p>
+          ) : (
+            <>
+              <div className="port-upload-checklist">
+                {groupUploadExperiments(portUploadSelection.experiments).map(
+                  ({ resultsScope, entries }) => {
+                    const groupKeys = entries.map(
+                      (entry) => `${entry.resultsScope}::${entry.name}`,
+                    )
+                    const selectedGroupCount = groupKeys.filter((key) =>
+                      portUploadSelection.selectedKeys.has(key),
+                    ).length
+                    const expanded = portUploadSelection.expandedScopes.has(resultsScope)
+
+                    function updateGroupSelection(select) {
+                      setPortUploadSelection((previous) => {
+                        if (!previous) {
+                          return previous
+                        }
+                        const selectedKeys = new Set(previous.selectedKeys)
+                        groupKeys.forEach((key) => {
+                          if (select) {
+                            selectedKeys.add(key)
+                          } else {
+                            selectedKeys.delete(key)
+                          }
+                        })
+                        return { ...previous, selectedKeys }
+                      })
+                    }
+
+                    return (
+                      <div className="port-upload-group" key={resultsScope}>
+                        <div className="port-upload-group-header">
+                          <button
+                            type="button"
+                            className="port-upload-group-toggle"
+                            onClick={() => {
+                              setPortUploadSelection((previous) => {
+                                if (!previous) {
+                                  return previous
+                                }
+                                const expandedScopes = new Set(previous.expandedScopes)
+                                if (expandedScopes.has(resultsScope)) {
+                                  expandedScopes.delete(resultsScope)
+                                } else {
+                                  expandedScopes.add(resultsScope)
+                                }
+                                return { ...previous, expandedScopes }
+                              })
+                            }}
+                            aria-expanded={expanded}
+                          >
+                            <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                            <span>
+                              <strong>{formatResultsScopeLabel(resultsScope)}</strong>
+                              <small>
+                                {selectedGroupCount} of {entries.length} sub-experiments selected
+                              </small>
+                            </span>
+                          </button>
+                          <div className="port-upload-group-actions">
+                            <button
+                              type="button"
+                              className="port-upload-group-action"
+                              onClick={() => updateGroupSelection(true)}
+                              disabled={selectedGroupCount === entries.length}
+                            >
+                              Select all
+                            </button>
+                            <button
+                              type="button"
+                              className="port-upload-group-action"
+                              onClick={() => updateGroupSelection(false)}
+                              disabled={selectedGroupCount === 0}
+                            >
+                              Deselect all
+                            </button>
+                          </div>
+                        </div>
+                        {expanded && (
+                          <div className="port-upload-group-entries">
+                            {entries.map((entry) => {
+                              const entryKey = `${entry.resultsScope}::${entry.name}`
+                              const checked = portUploadSelection.selectedKeys.has(entryKey)
+                              return (
+                                <label className="port-upload-option" key={entryKey}>
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={() => {
+                                      setPortUploadSelection((previous) => {
+                                        if (!previous) {
+                                          return previous
+                                        }
+                                        const selectedKeys = new Set(previous.selectedKeys)
+                                        if (selectedKeys.has(entryKey)) {
+                                          selectedKeys.delete(entryKey)
+                                        } else {
+                                          selectedKeys.add(entryKey)
+                                        }
+                                        return { ...previous, selectedKeys }
+                                      })
+                                    }}
+                                  />
+                                  <span>
+                                    <strong>{entry.name}</strong>
+                                  </span>
+                                </label>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  },
+                )}
+              </div>
+              <div className="port-upload-selector-actions">
+                <span>
+                  {portUploadSelection.selectedKeys.size} of {portUploadSelection.experiments.length}{' '}
+                  selected
+                </span>
+                <button type="button" className="tunnel-upload" onClick={confirmPortUploadSelection}>
+                  <Upload size={16} />
+                  Upload selected experiments
+                </button>
+              </div>
+            </>
+          )}
+        </section>
+      )}
 
       {errorMessage && <div className="error-banner">{errorMessage}</div>}
 
@@ -3745,19 +4075,19 @@ function App() {
               {uploadProgress.phase === 'uploading'
                 ? `Uploading ${uploadProgress.ready} file(s) to GitHub...`
                 : uploadProgress.phase === 'preparing'
-                  ? `Preparing result files for ${uploadProgress.subExperiment || uploadProgress.experiment}...`
+                  ? `Preparing result files for ${uploadProgress.subExperiment || uploadProgress.experiment}${
+                      uploadProgress.groupCount > 1
+                        ? ` (source ${(uploadProgress.preparedGroups || 0) + 1} of ${uploadProgress.groupCount})`
+                        : ''
+                    }...`
                   : uploadProgress.total > 0
                     ? `Preparing upload: ${uploadProgress.ready} of ${uploadProgress.total} file(s) ready`
                     : 'Preparing upload: finding result files...'}
             </span>
-            {uploadProgress.total > 0 && (
+            {(uploadProgress.total > 0 || uploadProgress.groupCount > 0) && (
               <span>
                 {(
-                  Math.floor(
-                    ((uploadProgress.completed ?? uploadProgress.ready) / uploadProgress.total) *
-                      1000 +
-                      Number.EPSILON * 1000,
-                  ) / 10
+                  Math.floor(uploadProgressFraction(uploadProgress) * 1000 + Number.EPSILON * 1000) / 10
                 ).toFixed(1)}
                 %
               </span>
@@ -3770,8 +4100,8 @@ function App() {
               </div>
           )}
           <progress
-            value={Math.min(uploadProgress.completed ?? uploadProgress.ready, uploadProgress.total)}
-            max={Math.max(uploadProgress.total, 1)}
+            value={Math.round(uploadProgressFraction(uploadProgress) * 100)}
+            max={100}
             aria-label="GitHub upload file preparation progress"
           />
         </div>
@@ -4410,20 +4740,43 @@ function App() {
           <div>
             <h2>Requests in flight</h2>
             <p>
-              {selectedIteration
-                ? `Concurrent requests during iteration ${selectedIteration}`
-                : 'Select an iteration to inspect concurrent requests'}
+              {requestTimelineCalculatedFor === selectedIteration && selectedIteration
+                ? requestMetric === 'cumulative'
+                  ? `Cumulative requests sent during iteration ${selectedIteration}`
+                  : requestMetric === 'total'
+                    ? `Total concurrent requests during iteration ${selectedIteration}`
+                    : `Concurrent requests by workload during iteration ${selectedIteration}`
+                : selectedIteration
+                  ? 'Calculate the request timeline for the selected iteration'
+                  : 'Select an iteration to inspect concurrent requests'}
             </p>
           </div>
-          <label className="request-timeline-toggle">
-            <input
-              type="checkbox"
-              checked={showTotalRequests}
-              onChange={(event) => setShowTotalRequests(event.target.checked)}
-              disabled={requestTimeline.profiles.length === 0}
-            />
-            <span>Show total requests</span>
-          </label>
+          <div className="request-timeline-actions">
+            <button
+              type="button"
+              className="request-timeline-calculate"
+              onClick={calculateRequestTimeline}
+              disabled={!selectedIteration || requestTimelineLoading}
+            >
+              {requestTimelineLoading
+                ? 'Calculating...'
+                : requestTimelineCalculatedFor === selectedIteration
+                  ? 'Recalculate'
+                  : 'Calculate requests in flight'}
+            </button>
+            <label className="request-timeline-picker">
+              <span>Request information</span>
+              <select
+                value={requestMetric}
+                onChange={(event) => setRequestMetric(event.target.value)}
+                disabled={requestTimeline.profiles.length === 0}
+              >
+                <option value="concurrent">Concurrent by workload</option>
+                <option value="total">Total concurrent</option>
+                <option value="cumulative">Cumulative sent</option>
+              </select>
+            </label>
+          </div>
         </div>
 
         <div className="request-timeline-chart">
@@ -4449,10 +4802,21 @@ function App() {
                 />
                 <YAxis
                   allowDecimals={false}
-                  label={{ value: 'Requests ongoing', angle: -90, position: 'insideLeft' }}
+                  label={{
+                    value: requestMetric === 'cumulative' ? 'Requests sent' : 'Requests ongoing',
+                    angle: -90,
+                    position: 'insideLeft',
+                  }}
                 />
                 <Tooltip
-                  formatter={(value, name) => [value, name === 'total' ? 'Total requests' : name]}
+                  formatter={(value, name) => [
+                    value,
+                    name === 'total'
+                      ? 'Total requests'
+                      : requestMetric === 'cumulative'
+                        ? `${name} requests sent`
+                        : name,
+                  ]}
                   labelFormatter={(value, payload) =>
                     payload?.[0]?.payload?.displayTime
                       ? `${payload[0].payload.displayTime} (${value}s)`
@@ -4462,7 +4826,7 @@ function App() {
                 <Legend
                   formatter={(value) => (value === 'total' ? 'Total requests' : value)}
                 />
-                {showTotalRequests ? (
+                {requestMetric === 'total' ? (
                   <Line
                     type="stepAfter"
                     dataKey="total"
@@ -4471,6 +4835,18 @@ function App() {
                     strokeWidth={2.8}
                     dot={false}
                   />
+                ) : requestMetric === 'cumulative' ? (
+                  requestTimeline.profiles.map((profile, index) => (
+                    <Line
+                      type="stepAfter"
+                      dataKey={(entry) => entry.cumulative[profile]}
+                      name={profile}
+                      key={profile}
+                      stroke={WORKLOAD_PROFILE_COLORS[index % WORKLOAD_PROFILE_COLORS.length]}
+                      strokeWidth={2.4}
+                      dot={false}
+                    />
+                  ))
                 ) : (
                   requestTimeline.profiles.map((profile, index) => (
                     <Line

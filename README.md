@@ -20,7 +20,7 @@ Frontend dashboard for visualizing experiment data served by MoST-API.
 	- Triangle node when evaluation is `FALSE`
 - Tooltip on hover with date, RPM, evaluation, and success rate
 - Detail panel on click showing full `results.csv` fields for the selected iteration
-- Bottom `Requests in flight` card showing concurrent requests over time for the selected iteration, with one colored line per `workload_profile` or an optional total line across all profiles. It reads request start/end timestamps from the API's `results_from_json.csv` conversion and supports legacy files using `received_timestamp` plus `complete_response_time`.
+- Bottom `Requests in flight` card showing concurrent requests over time for the selected iteration after pressing `Calculate requests in flight`, with one colored line per `workload_profile` or an optional total line across all profiles. It reads request start/end timestamps from the API's `results_from_json.csv` conversion and supports legacy files using `received_timestamp` plus `complete_response_time`.
 - Download buttons for `results.csv` and `results.json` in detail panel
 - Warning confirmation before `results.json` download
 - Automatic SSH tunnel startup when running `npm run dev`
